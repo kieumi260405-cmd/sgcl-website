@@ -13,12 +13,15 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ==================== CẤU HÌNH LƯU TRỮ ====================
+# =========================================================
+# 1. CẤU HÌNH LƯU TRỮ
+# =========================================================
+
 BASE_UPLOAD_DIR = Path("uploads")
 BASE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".pdf", ".xlsx", ".docx", ".png", ".jpg", ".jpeg"}
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+MAX_FILE_SIZE = 20 * 1024 * 1024
 
 
 def get_ship_folder(ship):
@@ -31,28 +34,117 @@ def calculate_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
 
+def format_size(size):
+    if size < 1024:
+        return f"{size} B"
+    elif size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.2f} MB"
+
+
+# =========================================================
+# 2. XEM TRƯỚC CHỨNG TỪ (đã hỗ trợ xem PDF trực tiếp)
+# =========================================================
+
 def get_file_preview(file_path):
+    """Xem trước chứng từ trực tiếp trên web."""
+    import base64
+    import pandas as pd
+
     ext = file_path.suffix.lower()
-    if ext == ".pdf":
-        import base64
-        pdf_bytes = file_path.read_bytes()
-        base64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
-        st.markdown(
-            f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>',
-            unsafe_allow_html=True
-        )
-    elif ext in [".png", ".jpg", ".jpeg"]:
-        st.image(str(file_path), use_container_width=True)
-    else:
-        st.info("Định dạng này chưa hỗ trợ xem trước trực tiếp. Vui lòng tải file xuống.")
+    file_bytes = file_path.read_bytes()
+
+    try:
+        # ---------- PDF: nhúng trực tiếp bằng iframe ----------
+        if ext == ".pdf":
+            b64 = base64.b64encode(file_bytes).decode("utf-8")
+
+            st.download_button(
+                "⬇️ Tải xuống PDF",
+                data=file_bytes,
+                file_name=file_path.name,
+                mime="application/pdf",
+                key=f"pdf_download_{file_path.name}"
+            )
+
+            pdf_display = f"""
+            <iframe
+                src="data:application/pdf;base64,{b64}"
+                width="100%"
+                height="750px"
+                style="border:1px solid #BFDBFE; border-radius:8px;"
+                type="application/pdf">
+            </iframe>
+            """
+            st.markdown(pdf_display, unsafe_allow_html=True)
+
+            st.caption("💡 Nếu trình duyệt không hiển thị PDF, hãy dùng nút **Tải xuống** phía trên.")
+
+        # ---------- Ảnh ----------
+        elif ext in [".png", ".jpg", ".jpeg"]:
+            st.image(
+                str(file_path),
+                caption=file_path.name,
+                use_container_width=True
+            )
+
+        # ---------- Excel ----------
+        elif ext == ".xlsx":
+            excel = pd.ExcelFile(file_path)
+
+            sheet_name = st.selectbox(
+                "Chọn trang tính",
+                excel.sheet_names,
+                key=f"preview_excel_{file_path.name}"
+            )
+
+            df = pd.read_excel(file_path, sheet_name=sheet_name)
+
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+        # ---------- Word ----------
+        elif ext == ".docx":
+            from docx import Document
+
+            doc = Document(str(file_path))
+
+            st.markdown(f"**Nội dung: {file_path.name}**")
+
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():
+                    st.write(paragraph.text)
+
+            for index, table in enumerate(doc.tables):
+                st.markdown(f"**Bảng {index + 1}**")
+
+                table_data = [
+                    [cell.text for cell in row.cells]
+                    for row in table.rows
+                ]
+
+                if table_data:
+                    st.table(table_data)
+
+        else:
+            st.warning("Định dạng chưa hỗ trợ xem trước.")
+
+    except Exception as e:
+        st.error(f"Không thể xem trước chứng từ: {str(e)}")
 
 
-# ==================== CSS – ÉP THEME SÁNG + XANH DƯƠNG ====================
+# =========================================================
+# 3. CSS – GIAO DIỆN TRẮNG VÀ XANH DƯƠNG
+# =========================================================
+
 css = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-html, body, .stApp, [data-testid="stAppViewContainer"], 
+html, body, .stApp, [data-testid="stAppViewContainer"],
 [data-testid="stHeader"], .main, .block-container {
     background-color: #FFFFFF !important;
     color: #1E293B !important;
@@ -62,8 +154,14 @@ html, body, [class*="css"] {
     font-family: 'Inter', system-ui, sans-serif !important;
 }
 
-#MainMenu, footer, header {visibility: hidden !important;}
-.block-container {padding-top: 1.2rem !important; max-width: 1280px;}
+#MainMenu, footer, header {
+    visibility: hidden !important;
+}
+
+.block-container {
+    padding-top: 1.2rem !important;
+    max-width: 1280px;
+}
 
 /* Nút chính */
 .stButton > button[kind="primary"] {
@@ -73,6 +171,7 @@ html, body, [class*="css"] {
     border-radius: 8px !important;
     font-weight: 600 !important;
 }
+
 .stButton > button[kind="primary"]:hover {
     background-color: #1D4ED8 !important;
 }
@@ -84,17 +183,20 @@ html, body, [class*="css"] {
     border: 1px solid #2563EB !important;
     border-radius: 8px !important;
 }
+
 .stButton > button:hover {
     background-color: #EFF6FF !important;
 }
 
 /* Input */
-.stTextInput input, .stTextArea textarea {
+.stTextInput input,
+.stTextArea textarea {
     background-color: #FFFFFF !important;
     color: #1E293B !important;
     border: 1px solid #BFDBFE !important;
     border-radius: 8px !important;
 }
+
 .stTextInput input:focus {
     border-color: #2563EB !important;
     box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15) !important;
@@ -108,7 +210,7 @@ html, body, [class*="css"] {
     border-radius: 8px !important;
 }
 
-/* ===== FILE UPLOADER ===== */
+/* File uploader */
 [data-testid="stFileUploader"] {
     background-color: #F8FAFC !important;
     border: 2px dashed #93C5FD !important;
@@ -140,8 +242,9 @@ html, body, [class*="css"] {
     color: #334155 !important;
 }
 
-/* ===== THÔNG BÁO ===== */
-.stAlert, div[data-testid="stAlert"] {
+/* Thông báo */
+.stAlert,
+div[data-testid="stAlert"] {
     background-color: #EFF6FF !important;
     color: #1E40AF !important;
     border: 1px solid #BFDBFE !important;
@@ -166,49 +269,32 @@ hr {
 }
 </style>
 """
+
 st.markdown(css, unsafe_allow_html=True)
 
-# ==================== STATE ====================
+
+# =========================================================
+# 4. STATE
+# =========================================================
+
 if "ships" not in st.session_state:
-    st.session_state.ships = [
-        {
-            "id": str(uuid.uuid4()),
-            "name": "PACIFIC STAR",
-            "imo": "9438107",
-            "voyage_no": "V.2411N",
-            "call_sign": "3EAB9",
-            "status": "Nháp",
-            "created_at": datetime.now().timestamp() - 172800,
-            "documents": [],
-            "extracted_data": None,
-            "step_status": {"1": "done", "2": "pending", "3": "pending", "4": "pending", "5": "pending"},
-            "current_step": 1,
-        },
-        {
-            "id": str(uuid.uuid4()),
-            "name": "EVER BLISS",
-            "imo": "9811000",
-            "voyage_no": "0428S",
-            "call_sign": "3EAB9",
-            "status": "Nháp",
-            "created_at": datetime.now().timestamp() - 86400,
-            "documents": [],
-            "extracted_data": None,
-            "step_status": {"1": "done", "2": "pending", "3": "pending", "4": "pending", "5": "pending"},
-            "current_step": 1,
-        }
-    ]
+    st.session_state.ships = []
 
 if "page" not in st.session_state:
     st.session_state.page = "list"
+
 if "current_ship_id" not in st.session_state:
     st.session_state.current_ship_id = None
+
 if "show_form" not in st.session_state:
     st.session_state.show_form = False
 
 
 def get_ship(sid):
-    return next((s for s in st.session_state.ships if s["id"] == sid), None)
+    return next(
+        (s for s in st.session_state.ships if s["id"] == sid),
+        None
+    )
 
 
 def badge(status):
@@ -219,11 +305,14 @@ def badge(status):
         "Đã xác nhận": ("#93C5FD", "#1E3A8A"),
         "Hoàn thành": ("#2563EB", "#FFFFFF"),
     }
+
     bg, color = styles.get(status, ("#F1F5F9", "#334155"))
     return f'<span style="background:{bg};color:{color};padding:4px 12px;border-radius:9999px;font-size:12px;font-weight:500;">{status}</span>'
 
 
-# ==================== HEADER ====================
+# =========================================================
+# 5. HEADER
+# =========================================================
 st.markdown("""
 <div style="display:flex;align-items:center;gap:12px;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid #DBEAFE;">
     <div style="width:42px;height:42px;background:#2563EB;border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-size:20px;">🚢</div>
@@ -234,27 +323,48 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ==================== TRANG DANH SÁCH ====================
+
+# =========================================================
+# 6. TRANG DANH SÁCH HỒ SƠ TÀU
+# =========================================================
+
 if st.session_state.page == "list":
+
     col1, col2 = st.columns([3.5, 1.2])
+
     with col1:
         st.markdown("### 🚢 Hồ Sơ Khai Báo Tàu Nhập Cảnh")
-        st.caption("Quản lý các chuyến tàu nhập cảnh, tự động trích xuất chứng từ và xuất mẫu Excel")
+        st.caption(
+            "Quản lý các chuyến tàu nhập cảnh, "
+            "tự động trích xuất chứng từ và xuất mẫu Excel"
+        )
+
     with col2:
-        if st.button("➕ Tạo hồ sơ mới", type="primary", use_container_width=True):
+        if st.button(
+            "➕ Tạo hồ sơ mới",
+            type="primary",
+            use_container_width=True
+        ):
             st.session_state.show_form = True
 
+    # ---------------- FORM TẠO HỒ SƠ ----------------
+
     if st.session_state.show_form:
+
         with st.form("form_ship", clear_on_submit=False):
+
             st.subheader("Tạo hồ sơ tàu mới")
+
             name = st.text_input("Tên tàu *", placeholder="VD: PACIFIC STAR")
             imo = st.text_input("Số IMO * (7 chữ số)", max_chars=7, placeholder="9438107")
             voyage = st.text_input("Số chuyến (Voyage No.) *", placeholder="V.2411N")
             call_sign = st.text_input("Hô hiệu (Call Sign) *", placeholder="3EAB9")
 
             c1, c2 = st.columns(2)
+
             with c1:
                 submitted = st.form_submit_button("Hoàn tất", type="primary", use_container_width=True)
+
             with c2:
                 cancel = st.form_submit_button("Hủy", use_container_width=True)
 
@@ -263,14 +373,18 @@ if st.session_state.page == "list":
                 st.rerun()
 
             if submitted:
-                if not name or not imo or not voyage or not call_sign:
-                    st.error("Vui lòng điền đầy đủ thông tin")
+
+                if not name.strip() or not imo.strip() or not voyage.strip() or not call_sign.strip():
+                    st.error("Vui lòng điền đầy đủ thông tin.")
+
                 elif not imo.isdigit() or len(imo) != 7:
-                    st.error("Số IMO phải gồm đúng 7 chữ số")
+                    st.error("Số IMO phải gồm đúng 7 chữ số.")
+
                 elif any(s["imo"] == imo for s in st.session_state.ships):
-                    st.error("Số IMO đã tồn tại")
+                    st.error("Số IMO đã tồn tại.")
+
                 else:
-                    st.session_state.ships.insert(0, {
+                    new_ship = {
                         "id": str(uuid.uuid4()),
                         "name": name.strip(),
                         "imo": imo,
@@ -280,70 +394,133 @@ if st.session_state.page == "list":
                         "created_at": datetime.now().timestamp(),
                         "documents": [],
                         "extracted_data": None,
-                        "step_status": {"1": "done", "2": "pending", "3": "pending", "4": "pending", "5": "pending"},
+                        "step_status": {
+                            "1": "done",
+                            "2": "pending",
+                            "3": "pending",
+                            "4": "pending",
+                            "5": "pending"
+                        },
                         "current_step": 1,
-                    })
+                    }
+
+                    st.session_state.ships.insert(0, new_ship)
                     st.session_state.show_form = False
                     st.success("Đã tạo hồ sơ thành công!")
                     time.sleep(0.5)
                     st.rerun()
 
+    # ---------------- TÌM KIẾM VÀ LỌC ----------------
+
     c1, c2, c3 = st.columns([3, 1.3, 1.3])
+
     with c1:
-        search = st.text_input("Tìm kiếm", placeholder="Tìm theo tên tàu, số IMO, số chuyến, hô hiệu", label_visibility="collapsed")
+        search = st.text_input(
+            "Tìm kiếm",
+            placeholder="Tìm theo tên tàu, số IMO, số chuyến, hô hiệu",
+            label_visibility="collapsed"
+        )
+
     with c2:
-        status_f = st.selectbox("Trạng thái", ["Tất cả trạng thái", "Nháp", "Đã tải chứng từ", "Đã trích xuất", "Đã xác nhận", "Hoàn thành"], label_visibility="collapsed")
+        status_f = st.selectbox(
+            "Trạng thái",
+            ["Tất cả trạng thái", "Nháp", "Đã tải chứng từ", "Đã trích xuất", "Đã xác nhận", "Hoàn thành"],
+            label_visibility="collapsed"
+        )
+
     with c3:
-        sort_f = st.selectbox("Sắp xếp", ["Mới tạo nhất trước", "Cũ nhất trước"], label_visibility="collapsed")
+        sort_f = st.selectbox(
+            "Sắp xếp",
+            ["Mới tạo nhất trước", "Cũ nhất trước"],
+            label_visibility="collapsed"
+        )
 
     ships = st.session_state.ships[:]
+
     if search:
         q = search.lower()
-        ships = [s for s in ships if q in s["name"].lower() or q in s["imo"] or q in s["voyage_no"].lower() or q in s["call_sign"].lower()]
+        ships = [
+            s for s in ships
+            if q in s["name"].lower()
+            or q in s["imo"]
+            or q in s["voyage_no"].lower()
+            or q in s["call_sign"].lower()
+        ]
+
     if status_f != "Tất cả trạng thái":
         ships = [s for s in ships if s["status"] == status_f]
-    ships = sorted(ships, key=lambda x: x["created_at"], reverse=(sort_f == "Mới tạo nhất trước"))
+
+    ships = sorted(
+        ships,
+        key=lambda x: x["created_at"],
+        reverse=(sort_f == "Mới tạo nhất trước")
+    )
 
     st.markdown("")
 
+    # ---------------- DANH SÁCH HỒ SƠ ----------------
+
     if not ships:
         st.info("Chưa có hồ sơ tàu nào. Nhấn **Tạo hồ sơ mới** để bắt đầu.")
+
     else:
         h1, h2, h3, h4, h5, h6 = st.columns([2.6, 1.3, 1.1, 1.5, 1.3, 1.6])
+
         h1.markdown("**Tên tàu / IMO**")
         h2.markdown("**Số chuyến**")
         h3.markdown("**Hô hiệu**")
         h4.markdown("**Trạng thái**")
         h5.markdown("**Ngày tạo**")
         h6.markdown("**Thao tác**")
+
         st.divider()
 
         for ship in ships:
             c1, c2, c3, c4, c5, c6 = st.columns([2.6, 1.3, 1.1, 1.5, 1.3, 1.6])
+
             with c1:
                 st.markdown(f"**{ship['name']}**  `IMO: {ship['imo']}`")
+
             with c2:
                 st.write(ship["voyage_no"])
+
             with c3:
                 st.write(ship["call_sign"])
+
             with c4:
                 st.markdown(badge(ship["status"]), unsafe_allow_html=True)
+
             with c5:
                 st.caption(datetime.fromtimestamp(ship["created_at"]).strftime("%d/%m/%Y %H:%M"))
+
             with c6:
                 b1, b2 = st.columns(2)
+
                 if b1.button("Xử lý", key=f"p_{ship['id']}", use_container_width=True):
                     st.session_state.current_ship_id = ship["id"]
                     st.session_state.page = "detail"
                     st.rerun()
+
                 if b2.button("🗑️", key=f"d_{ship['id']}", use_container_width=True):
+                    folder = BASE_UPLOAD_DIR / f"{ship['imo']}_{ship['id']}"
+                    if folder.exists():
+                        import shutil
+                        shutil.rmtree(folder, ignore_errors=True)
+
                     st.session_state.ships = [s for s in st.session_state.ships if s["id"] != ship["id"]]
                     st.rerun()
+
             st.divider()
 
-# ==================== TRANG CHI TIẾT ====================
+
+# =========================================================
+# 7. TRANG CHI TIẾT HỒ SƠ TÀU
+# =========================================================
+
 else:
+
     ship = get_ship(st.session_state.current_ship_id)
+
     if not ship:
         st.session_state.page = "list"
         st.rerun()
@@ -357,7 +534,9 @@ else:
     st.markdown(f"""
     <div style="background:#FFFFFF;border:1px solid #BFDBFE;border-radius:14px;padding:20px;margin:12px 0 20px 0;">
         <div style="display:flex;gap:16px;align-items:center;">
-            <div style="width:52px;height:52px;background:#DBEAFE;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:26px;">🚢</div>
+            <div style="width:52px;height:52px;background:#DBEAFE;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:26px;">
+                🚢
+            </div>
             <div>
                 <div style="font-size:18px;font-weight:700;color:#000000;">{ship['name']}</div>
                 <div style="color:#1D4ED8;font-size:13px;margin-top:2px;">Thông tin hồ sơ khai báo tàu nhập cảnh</div>
@@ -371,57 +550,81 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-    steps = [(1, "Thông tin tàu"), (2, "Tải chứng từ"), (3, "Trích xuất"), (4, "Kiểm tra"), (5, "Xuất Excel")]
+    # ---------------- THANH 5 BƯỚC ----------------
+
+    steps = [
+        (1, "Thông tin tàu"),
+        (2, "Tải chứng từ"),
+        (3, "Trích xuất"),
+        (4, "Kiểm tra"),
+        (5, "Xuất Excel")
+    ]
+
     cols = st.columns(5)
+
     for i, (sid, title) in enumerate(steps):
         active = ship["current_step"] == sid
         done = ship["step_status"].get(str(sid)) == "done"
+
         label = f"{'✅' if done else '🔵' if active else '⚪'} {title}"
+
         if cols[i].button(label, key=f"st_{sid}", use_container_width=True):
             ship["current_step"] = sid
             st.rerun()
 
     st.markdown("---")
+
     step = ship["current_step"]
 
-    # ---------- BƯỚC 1 ----------
+
+    # =====================================================
+    # BƯỚC 1 – THÔNG TIN TÀU
+    # =====================================================
+
     if step == 1:
+
         st.subheader("1. Thông tin tàu")
+
         c1, c2 = st.columns(2)
+
         c1.info(f"**Tên tàu:** {ship['name']}")
         c1.info(f"**Số IMO:** {ship['imo']}")
+
         c2.info(f"**Số chuyến:** {ship['voyage_no']}")
         c2.info(f"**Hô hiệu:** {ship['call_sign']}")
+
         if st.button("Xác nhận & Tiếp tục →", type="primary"):
             ship["step_status"]["1"] = "done"
             ship["current_step"] = 2
             st.rerun()
 
-    # ---------- BƯỚC 2 ----------
+
+    # =====================================================
+    # BƯỚC 2 – TẢI CHỨNG TỪ
+    # =====================================================
+
     elif step == 2:
+
         st.subheader("2. Tải chứng từ")
+
         st.caption("Tiếp nhận và quản lý chứng từ khai báo tàu nhập cảnh.")
 
         ship_folder = get_ship_folder(ship)
+
         if "documents" not in ship:
             ship["documents"] = []
 
         total_files = len(ship["documents"])
         total_size = sum(d.get("size", 0) for d in ship["documents"])
 
-        def format_size(size):
-            if size < 1024:
-                return f"{size} B"
-            elif size < 1024 * 1024:
-                return f"{size / 1024:.1f} KB"
-            return f"{size / (1024 * 1024):.2f} MB"
-
         c1, c2, c3 = st.columns(3)
+
         c1.metric("Tổng chứng từ", total_files)
         c2.metric("Dung lượng", format_size(total_size))
         c3.metric("Định dạng hỗ trợ", "PDF, XLSX, DOCX, JPG, PNG")
 
         st.divider()
+
         st.markdown("#### 📤 Tải lên chứng từ")
 
         uploaded_files = st.file_uploader(
@@ -432,13 +635,17 @@ else:
         )
 
         if uploaded_files:
+
             if st.button("⬆️ Xác nhận tải lên", type="primary", key=f"confirm_upload_{ship['id']}"):
+
                 success_count = 0
                 errors = []
+
                 existing_hashes = {d.get("hash") for d in ship["documents"] if d.get("hash")}
                 existing_names = {d["name"].lower() for d in ship["documents"]}
 
                 for uploaded_file in uploaded_files:
+
                     file_name = Path(uploaded_file.name).name
                     file_ext = Path(file_name).suffix.lower()
                     file_bytes = uploaded_file.getvalue()
@@ -446,24 +653,30 @@ else:
                     if file_ext not in ALLOWED_EXTENSIONS:
                         errors.append(f"{file_name}: Định dạng không được hỗ trợ.")
                         continue
+
                     if not file_bytes:
                         errors.append(f"{file_name}: File rỗng hoặc không hợp lệ.")
                         continue
+
                     if len(file_bytes) > MAX_FILE_SIZE:
                         errors.append(f"{file_name}: File vượt quá giới hạn 20 MB.")
                         continue
+
                     if file_name.lower() in existing_names:
                         errors.append(f"{file_name}: Tên file đã tồn tại trong hồ sơ.")
                         continue
 
                     file_hash = calculate_file_hash(file_bytes)
+
                     if file_hash in existing_hashes:
                         errors.append(f"{file_name}: Nội dung file đã tồn tại.")
                         continue
 
                     file_path = ship_folder / file_name
+
                     try:
                         file_path.write_bytes(file_bytes)
+
                         ship["documents"].append({
                             "name": file_name,
                             "size": len(file_bytes),
@@ -471,59 +684,58 @@ else:
                             "path": str(file_path),
                             "uploaded_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
                         })
+
                         existing_names.add(file_name.lower())
                         existing_hashes.add(file_hash)
                         success_count += 1
+
                     except OSError as e:
                         errors.append(f"{file_name}: Không thể lưu file ({e}).")
 
                 if success_count > 0:
                     ship["status"] = "Đã tải chứng từ"
                     st.success(f"Đã tải thành công {success_count} chứng từ.")
+
                 if errors:
                     for error in errors:
                         st.warning(error)
+
                 st.rerun()
 
         st.divider()
+
         st.markdown("#### 📁 Danh sách chứng từ")
 
         if not ship["documents"]:
-            # Khung thông báo sáng đẹp
+
             st.markdown("""
-            <div style="
-                background: #EFF6FF;
-                border: 1px solid #BFDBFE;
-                border-radius: 12px;
-                padding: 18px 22px;
-                color: #1E40AF;
-                font-size: 15px;
-                display: flex;
-                align-items: center;
-                gap: 12px;
-                margin-bottom: 12px;
-            ">
-                <span style="font-size: 22px;">📂</span>
+            <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:12px;padding:18px 22px;color:#1E40AF;font-size:15px;display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+                <span style="font-size:22px;">📂</span>
                 <div>
                     <strong>Hồ sơ chưa có chứng từ</strong><br>
-                    <span style="font-size: 13.5px; opacity: 0.85;">Vui lòng tải file lên để tiếp tục xử lý.</span>
+                    <span style="font-size:13.5px;opacity:0.85;">Vui lòng tải file lên để tiếp tục xử lý.</span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
+
         else:
+
             st.write(f"Đang quản lý **{len(ship['documents'])} chứng từ**")
 
             for i, doc in enumerate(ship["documents"]):
+
                 file_path = Path(doc.get("path", ""))
                 file_exists = file_path.is_file()
 
                 with st.container(border=True):
+
                     col1, col2, col3, col4 = st.columns([3.5, 1.2, 1.2, 1.1])
 
                     with col1:
                         ext = Path(doc["name"]).suffix.upper()
                         st.markdown(f"**📄 {doc['name']}**")
                         st.caption(f"{ext} · {format_size(doc['size'])} · {doc.get('uploaded_at', 'Không rõ thời gian')}")
+
                         if not file_exists:
                             st.error("File không tồn tại trên hệ thống.")
 
@@ -531,6 +743,7 @@ else:
                         if file_exists:
                             with open(file_path, "rb") as f:
                                 file_data = f.read()
+
                             st.download_button(
                                 "⬇️ Tải xuống",
                                 data=file_data,
@@ -548,112 +761,134 @@ else:
                         if st.button("🗑️ Xóa", key=f"delete_{ship['id']}_{i}", use_container_width=True):
                             if file_exists:
                                 file_path.unlink()
-                            if st.session_state.get(f"preview_doc_{ship['id']}") == doc["name"]:
-                                del st.session_state[f"preview_doc_{ship['id']}"]
+
+                            preview_key = f"preview_doc_{ship['id']}"
+                            if st.session_state.get(preview_key) == doc["name"]:
+                                del st.session_state[preview_key]
+
                             ship["documents"].pop(i)
+
                             if not ship["documents"]:
                                 ship["status"] = "Nháp"
+
                             st.success("Đã xóa chứng từ.")
                             st.rerun()
 
-            # Xem trước
+            # ---------------- XEM TRƯỚC ----------------
+
             preview_name = st.session_state.get(f"preview_doc_{ship['id']}")
+
             if preview_name:
                 preview_doc = next((d for d in ship["documents"] if d["name"] == preview_name), None)
+
                 if preview_doc:
                     preview_path = Path(preview_doc["path"])
+
                     st.divider()
                     st.markdown("#### 👁️ Xem trước chứng từ")
                     st.markdown(f"**{preview_name}**")
+
                     if preview_path.is_file():
                         get_file_preview(preview_path)
                     else:
                         st.error("Không tìm thấy file để xem trước.")
+
                     if st.button("Đóng xem trước", key=f"close_preview_{ship['id']}"):
                         del st.session_state[f"preview_doc_{ship['id']}"]
                         st.rerun()
 
+        # ---------------- ĐIỀU HƯỚNG ----------------
+
         st.divider()
+
         c1, c2 = st.columns(2)
+
         with c1:
             if st.button("← Quay lại", use_container_width=True):
                 ship["current_step"] = 1
                 st.rerun()
+
         with c2:
-            if st.button("Hoàn tất & Tiếp tục →", type="primary", use_container_width=True, disabled=not ship["documents"]):
+            if st.button(
+                "Hoàn tất & Tiếp tục →",
+                type="primary",
+                use_container_width=True,
+                disabled=not ship["documents"]
+            ):
                 ship["step_status"]["2"] = "done"
                 ship["current_step"] = 3
                 st.rerun()
 
-    # ---------- BƯỚC 3 ----------
+
+    # =====================================================
+    # BƯỚC 3 – OCR
+    # =====================================================
+
     elif step == 3:
+
         st.subheader("3. Trích xuất dữ liệu (OCR)")
+
         if not ship["documents"]:
-            st.warning("Chưa có chứng từ. Quay lại bước 2.")
+            st.warning("Chưa có chứng từ. Vui lòng quay lại bước 2.")
         else:
-            if st.button("🤖 Bắt đầu trích xuất", type="primary"):
-                with st.spinner("Đang chạy OCR..."):
-                    time.sleep(1.5)
-                    ship["extracted_data"] = {
-                        "shipName": ship["name"],
-                        "imo": ship["imo"],
-                        "voyageNo": ship["voyage_no"],
-                        "callSign": ship["call_sign"],
-                        "flag": "Panama",
-                        "portOfArrival": "Cảng Cát Lái",
-                        "cargoType": "Container",
-                        "grossTonnage": "24500",
-                        "agent": "SGCL – SHIPPING AGENT"
-                    }
-                    ship["status"] = "Đã trích xuất"
-                    st.success("Trích xuất thành công!")
-                    st.rerun()
-            if ship.get("extracted_data"):
-                st.json(ship["extracted_data"])
+            st.info(
+                "Chức năng OCR đang chờ cấu hình. "
+                "Các trường thông tin sẽ được thiết lập "
+                "theo danh sách chứng từ và yêu cầu trích xuất."
+            )
+
+            st.markdown("""
+            <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:12px;padding:20px;">
+                <div style="font-size:16px;font-weight:600;color:#1E293B;">🤖 Hệ thống trích xuất dữ liệu</div>
+                <p style="color:#64748B;font-size:14px;margin-top:8px;">
+                    Chưa có dữ liệu OCR. Hệ thống sẽ được cấu hình sau khi xác định các trường cần đọc từ từng loại chứng từ.
+                </p>
+                <div style="color:#2563EB;font-size:13px;font-weight:500;">Trạng thái: Chờ cấu hình OCR</div>
+            </div>
+            """, unsafe_allow_html=True)
 
         c1, c2 = st.columns(2)
-        if c1.button("← Quay lại"):
-            ship["current_step"] = 2
-            st.rerun()
-        if c2.button("Xác nhận & Tiếp tục →", type="primary", disabled=not ship.get("extracted_data")):
-            ship["step_status"]["3"] = "done"
-            ship["current_step"] = 4
-            st.rerun()
 
-    # ---------- BƯỚC 4 ----------
-    elif step == 4:
-        st.subheader("4. Kiểm tra dữ liệu")
-        data = ship.get("extracted_data")
-        if not data:
-            st.warning("Chưa có dữ liệu.")
-        else:
-            for k, v in data.items():
-                data[k] = st.text_input(k, value=str(v))
-            if st.button("Xác nhận dữ liệu & Tiếp tục →", type="primary"):
-                ship["extracted_data"] = data
-                ship["step_status"]["4"] = "done"
-                ship["status"] = "Đã xác nhận"
-                ship["current_step"] = 5
+        with c1:
+            if st.button("← Quay lại"):
+                ship["current_step"] = 2
                 st.rerun()
+
+        with c2:
+            st.button("Xác nhận & Tiếp tục →", type="primary", disabled=True, use_container_width=True)
+
+
+    # =====================================================
+    # BƯỚC 4 – KIỂM TRA DỮ LIỆU
+    # =====================================================
+
+    elif step == 4:
+
+        st.subheader("4. Kiểm tra dữ liệu")
+
+        st.info(
+            "Bước kiểm tra sẽ được kích hoạt sau khi hoàn thiện "
+            "chức năng OCR và cấu trúc dữ liệu trích xuất."
+        )
+
         if st.button("← Quay lại"):
             ship["current_step"] = 3
             st.rerun()
 
-    # ---------- BƯỚC 5 ----------
+
+    # =====================================================
+    # BƯỚC 5 – XUẤT EXCEL
+    # =====================================================
+
     elif step == 5:
+
         st.subheader("5. Xuất Excel NSW")
-        if not ship.get("extracted_data"):
-            st.warning("Chưa xác nhận dữ liệu.")
-        else:
-            st.success("✅ Dữ liệu đã sẵn sàng")
-            if st.button("📊 Xuất Excel NSW", type="primary"):
-                with st.spinner("Đang tạo file..."):
-                    time.sleep(1)
-                    ship["step_status"]["5"] = "done"
-                    ship["status"] = "Hoàn thành"
-                    content = f"SGCL - SHIPPING AGENT\nTên tàu: {ship['name']}\nIMO: {ship['imo']}\nVoyage: {ship['voyage_no']}\nCall Sign: {ship['call_sign']}"
-                    st.download_button("⬇️ Tải file", data=content, file_name=f"NSW_{ship['imo']}.txt")
-                    st.success("Xuất thành công!")
+
+        st.info(
+            "Chức năng xuất Excel sẽ được hoàn thiện sau khi "
+            "xác định cấu trúc dữ liệu OCR và mẫu Excel NSW."
+        )
+
         if st.button("← Quay lại"):
             ship["current_step"] = 4
             st.rerun()
