@@ -239,90 +239,175 @@ def sgcl_image_to_data_url(image):
 
     return f"data:image/png;base64,{image_base64}"
 
-
 def sgcl_extract_with_ai(
     image,
     field_name,
     extraction_type="single"
 ):
-    """Gửi vùng ảnh hoặc toàn trang đến AI."""
-
-    client = OpenAI(
-        api_key=sgcl_get_api_key()
-    )
-
-    image_url = sgcl_image_to_data_url(image)
-
-    if extraction_type == "table":
-        output_format = """
-        Trả về JSON theo cấu trúc:
-        {
-            "headers": ["Tên cột 1", "Tên cột 2"],
-            "rows": [
-                ["Giá trị hàng 1", "Giá trị hàng 1"],
-                ["Giá trị hàng 2", "Giá trị hàng 2"]
-            ]
-        }
-        Nếu không đọc được, trả về headers và rows rỗng.
-        """
-    else:
-        output_format = """
-        Trả về JSON theo cấu trúc:
-        {
-            "value": "Giá trị được trích xuất"
-        }
-        Nếu không đọc được, value là chuỗi rỗng.
-        """
-
-    prompt = f"""
-    Bạn là hệ thống AI hỗ trợ xử lý chứng từ hàng hải.
-
-    Yêu cầu:
-    Chỉ trích xuất thông tin sau: {field_name}
-
-    Không tự suy đoán hoặc tự bổ sung dữ liệu.
-    Nếu thông tin không rõ, hãy để trống.
-    Giữ nguyên nội dung, số liệu và định dạng quan trọng
-    như ngày tháng, số hiệu, tên riêng.
-
-    {output_format}
-
-    Chỉ trả về JSON hợp lệ, không giải thích thêm.
+    """
+    Nhận diện chữ bằng Tesseract OCR.
+    Không sử dụng OpenAI hoặc Gemini API.
     """
 
-    response = client.responses.create(
-        model=os.environ.get(
-            "OPENAI_MODEL",
-            "gpt-4.1-mini"
-        ),
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": prompt
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": image_url
-                    }
-                ]
-            }
-        ]
+    import pytesseract
+    import re
+    from pytesseract import Output
+
+    # Chuyển ảnh về RGB để OCR
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    # Phóng to ảnh để cải thiện nhận diện
+    scale = 2
+    image = image.resize(
+        (image.width * scale, image.height * scale)
     )
 
-    raw_result = str(
-    response.output_text or ""
-).strip()
+    # OCR toàn bộ nội dung
+    ocr_data = pytesseract.image_to_data(
+        image,
+        lang="eng",
+        config="--oem 3 --psm 6",
+        output_type=Output.DICT
+    )
 
-    if raw_result.startswith("```"):
-        raw_result = raw_result.replace(
-            "```json", ""
-        ).replace("```", "").strip()
+    # Gom các từ thành từng dòng
+    lines = {}
 
-    return json.loads(raw_result)
+    for i, word in enumerate(ocr_data["text"]):
+        word = word.strip()
 
+        if not word:
+            continue
+
+        key = (
+            ocr_data["block_num"][i],
+            ocr_data["par_num"][i],
+            ocr_data["line_num"][i]
+        )
+
+        if key not in lines:
+            lines[key] = []
+
+        lines[key].append({
+            "text": word,
+            "left": ocr_data["left"][i],
+            "width": ocr_data["width"][i]
+        })
+
+    # Sắp xếp từ theo vị trí trái sang phải
+    ocr_lines = []
+
+    for words in lines.values():
+        words.sort(key=lambda x: x["left"])
+
+        line_text = " ".join(
+            word["text"] for word in words
+        )
+
+        ocr_lines.append({
+            "text": line_text,
+            "words": words
+        })
+
+    full_text = "\n".join(
+        line["text"] for line in ocr_lines
+    )
+
+    # ==================================
+    # TRƯỜNG HỢP TRÍCH XUẤT BẢNG
+    # ==================================
+    if extraction_type == "table":
+
+        rows = []
+
+        for line in ocr_lines:
+            words = line["words"]
+
+            if not words:
+                continue
+
+            cells = []
+            current_cell = words[0]["text"]
+            previous_right = (
+                words[0]["left"] + words[0]["width"]
+            )
+
+            for word in words[1:]:
+
+                gap = word["left"] - previous_right
+
+                # Khoảng cách lớn được xem là ranh giới cột
+                if gap > 35:
+                    cells.append(current_cell)
+                    current_cell = word["text"]
+                else:
+                    current_cell += " " + word["text"]
+
+                previous_right = (
+                    word["left"] + word["width"]
+                )
+
+            cells.append(current_cell)
+            rows.append(cells)
+
+        if not rows:
+            return {
+                "headers": [],
+                "rows": []
+            }
+
+        headers = rows[0]
+        data_rows = rows[1:]
+
+        return {
+            "headers": headers,
+            "rows": data_rows
+        }
+
+    # ==================================
+    # TRƯỜNG HỢP TRÍCH XUẤT THÔNG TIN
+    # ==================================
+
+    field_normalized = re.sub(
+        r"[^a-z0-9]",
+        "",
+        field_name.lower()
+    )
+
+    extracted_value = ""
+
+    # Tìm dòng có chứa tên trường cần lấy
+    for index, line in enumerate(ocr_lines):
+
+        line_text = line["text"]
+
+        line_normalized = re.sub(
+            r"[^a-z0-9]",
+            "",
+            line_text.lower()
+        )
+
+        if field_normalized and field_normalized in line_normalized:
+
+            # Lấy nội dung phía sau dấu :
+            if ":" in line_text:
+                extracted_value = line_text.split(
+                    ":", 1
+                )[1].strip()
+
+            # Nếu không có giá trị trên cùng dòng,
+            # thử lấy dòng kế tiếp
+            if not extracted_value and index + 1 < len(ocr_lines):
+                extracted_value = ocr_lines[
+                    index + 1
+                ]["text"]
+
+            break
+
+    return {
+        "value": extracted_value
+    }
 
 def sgcl_write_to_excel(
     workbook_bytes,
