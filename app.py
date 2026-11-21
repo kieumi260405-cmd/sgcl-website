@@ -14,7 +14,19 @@ from openai import OpenAI
 from streamlit_drawable_canvas import st_canvas
 import fitz
 import openpyxl
+import sys
+import os
+import locale
 
+os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ["LANG"] = "C.UTF-8"
+os.environ["LC_ALL"] = "C.UTF-8"
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(
+            encoding="utf-8",
+            errors="replace"
+        )
 st.set_page_config(
     page_title="SGCL – SHIPPING AGENT",
     page_icon="🚢",
@@ -147,14 +159,17 @@ def get_file_preview(file_path):
 # =========================================================
 
 def sgcl_get_api_key():
-    """Lấy API Key từ Colab hoặc Streamlit Secrets."""
-    api_key = os.environ.get("OPENAI_API_KEY")
+    """Lấy API Key từ Streamlit Secrets hoặc Google Colab."""
+
+    api_key = None
+
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        api_key = None
 
     if not api_key:
-        try:
-            api_key = st.secrets.get("OPENAI_API_KEY")
-        except Exception:
-            api_key = None
+        api_key = os.environ.get("OPENAI_API_KEY")
 
     if not api_key:
         raise ValueError(
@@ -162,9 +177,7 @@ def sgcl_get_api_key():
             "Vui lòng kiểm tra phần Secrets."
         )
 
-    return api_key
-
-
+    return str(api_key).strip()
 def sgcl_get_document_bytes(doc):
     """Đọc chứng từ đã tải lên ở Bước 2."""
     file_path = Path(doc["path"])
@@ -299,7 +312,9 @@ def sgcl_extract_with_ai(
         ]
     )
 
-    raw_result = response.output_text.strip()
+    raw_result = str(
+    response.output_text or ""
+).strip()
 
     if raw_result.startswith("```"):
         raw_result = raw_result.replace(
@@ -1132,15 +1147,16 @@ else:
                                 "File không tồn tại trên hệ thống."
                             )
 
+                   
                     with col2:
                         if file_exists:
-                            with open(file_path, "rb") as f:
-                                file_data = f.read()
+                            file_data = file_path.read_bytes()
 
                             st.download_button(
                                 "⬇️ Tải xuống",
                                 data=file_data,
                                 file_name=doc["name"],
+                                mime="application/octet-stream",
                                 key=f"download_{ship['id']}_{i}",
                                 use_container_width=True
                             )
@@ -1453,6 +1469,7 @@ else:
 
                 st.divider()
 
+                
                 if st.button(
                     "🤖 Bắt đầu trích xuất bằng AI",
                     type="primary",
@@ -1523,9 +1540,20 @@ else:
 
                         except Exception as e:
 
+                            import traceback
+
                             st.error(
                                 f"Lỗi khi trích xuất: {str(e)}"
                             )
+
+                            with st.expander(
+                                "Chi tiết lỗi kỹ thuật"
+                            ):
+
+                                st.code(
+                                    traceback.format_exc(),
+                                    language="python"
+                                )
 
             except Exception as e:
 
