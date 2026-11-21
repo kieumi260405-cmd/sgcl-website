@@ -43,22 +43,85 @@ def format_size(size):
 
 
 # =========================================================
-# 2. XEM TRƯỚC CHỨNG TỪ (đã hỗ trợ xem PDF trực tiếp)
+# 2. XEM TRƯỚC CHỨNG TỪ
+#    - PDF: chuyển từng trang thành ảnh bằng PyMuPDF
+#      (Chrome chặn PDF nhúng dạng data:base64 trong iframe)
+#    - DOCX: đọc trực tiếp cấu trúc XML, không cần python-docx
 # =========================================================
+
+@st.cache_data(show_spinner=False)
+def render_pdf_pages(file_bytes, zoom=1.6):
+    """Chuyển các trang PDF thành ảnh PNG."""
+    import fitz  # PyMuPDF
+
+    images = []
+    with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
+        matrix = fitz.Matrix(zoom, zoom)
+        for page in pdf:
+            pix = page.get_pixmap(matrix=matrix)
+            images.append(pix.tobytes("png"))
+    return images
+
+
+def read_docx_blocks(file_path):
+    """
+    Đọc nội dung DOCX theo đúng thứ tự (đoạn văn + bảng)
+    bằng zipfile/XML, không phụ thuộc thư viện python-docx.
+    """
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+    def paragraph_text(p):
+        parts = []
+        for node in p.iter():
+            if node.tag == W + "t" and node.text:
+                parts.append(node.text)
+            elif node.tag == W + "tab":
+                parts.append("\t")
+            elif node.tag in (W + "br", W + "cr"):
+                parts.append("\n")
+        return "".join(parts)
+
+    with zipfile.ZipFile(file_path) as z:
+        root = ET.fromstring(z.read("word/document.xml"))
+
+    body = root.find(W + "body")
+    blocks = []
+
+    for child in body:
+        if child.tag == W + "p":
+            text = paragraph_text(child)
+            if text.strip():
+                blocks.append(("text", text))
+
+        elif child.tag == W + "tbl":
+            rows = []
+            for tr in child.findall(W + "tr"):
+                row = []
+                for tc in tr.findall(W + "tc"):
+                    cell = "\n".join(
+                        paragraph_text(p) for p in tc.findall(W + "p")
+                    ).strip()
+                    row.append(cell)
+                rows.append(row)
+            if rows:
+                blocks.append(("table", rows))
+
+    return blocks
+
 
 def get_file_preview(file_path):
     """Xem trước chứng từ trực tiếp trên web."""
-    import base64
     import pandas as pd
 
     ext = file_path.suffix.lower()
     file_bytes = file_path.read_bytes()
 
     try:
-        # ---------- PDF: nhúng trực tiếp bằng iframe ----------
+        # ---------- PDF ----------
         if ext == ".pdf":
-            b64 = base64.b64encode(file_bytes).decode("utf-8")
-
             st.download_button(
                 "⬇️ Tải xuống PDF",
                 data=file_bytes,
@@ -67,18 +130,54 @@ def get_file_preview(file_path):
                 key=f"pdf_download_{file_path.name}"
             )
 
-            pdf_display = f"""
-            <iframe
-                src="data:application/pdf;base64,{b64}"
-                width="100%"
-                height="750px"
-                style="border:1px solid #BFDBFE; border-radius:8px;"
-                type="application/pdf">
-            </iframe>
-            """
-            st.markdown(pdf_display, unsafe_allow_html=True)
+            try:
+                with st.spinner("Đang hiển thị PDF..."):
+                    pages = render_pdf_pages(file_bytes)
+            except ImportError:
+                st.warning(
+                    "Thiếu thư viện PyMuPDF. Chạy lệnh: `pip install pymupdf` "
+                    "rồi khởi động lại ứng dụng."
+                )
+                return
 
-            st.caption("💡 Nếu trình duyệt không hiển thị PDF, hãy dùng nút **Tải xuống** phía trên.")
+            total = len(pages)
+            st.caption(f"Tổng số trang: {total}")
+
+            if total == 0:
+                st.warning("File PDF không có trang nào.")
+                return
+
+            if total > 1:
+                view_mode = st.radio(
+                    "Chế độ xem",
+                    ["Từng trang", "Tất cả các trang"],
+                    horizontal=True,
+                    key=f"pdf_mode_{file_path.name}"
+                )
+            else:
+                view_mode = "Tất cả các trang"
+
+            if view_mode == "Từng trang":
+                page_no = st.number_input(
+                    "Trang",
+                    min_value=1,
+                    max_value=total,
+                    value=1,
+                    step=1,
+                    key=f"pdf_page_{file_path.name}"
+                )
+                st.image(
+                    pages[page_no - 1],
+                    caption=f"Trang {page_no}/{total}",
+                    use_container_width=True
+                )
+            else:
+                for i, img in enumerate(pages, start=1):
+                    st.image(
+                        img,
+                        caption=f"Trang {i}/{total}",
+                        use_container_width=True
+                    )
 
         # ---------- Ảnh ----------
         elif ext in [".png", ".jpg", ".jpeg"]:
@@ -108,32 +207,37 @@ def get_file_preview(file_path):
 
         # ---------- Word ----------
         elif ext == ".docx":
-            from docx import Document
+            blocks = read_docx_blocks(file_path)
 
-            doc = Document(str(file_path))
+            if not blocks:
+                st.info("File Word không có nội dung văn bản.")
+                return
 
-            st.markdown(f"**Nội dung: {file_path.name}**")
-
-            for paragraph in doc.paragraphs:
-                if paragraph.text.strip():
-                    st.write(paragraph.text)
-
-            for index, table in enumerate(doc.tables):
-                st.markdown(f"**Bảng {index + 1}**")
-
-                table_data = [
-                    [cell.text for cell in row.cells]
-                    for row in table.rows
-                ]
-
-                if table_data:
-                    st.table(table_data)
+            with st.container(border=True):
+                table_index = 0
+                for kind, content in blocks:
+                    if kind == "text":
+                        st.markdown(
+                            content.replace("\n", "  \n")
+                        )
+                    else:
+                        table_index += 1
+                        st.markdown(f"**Bảng {table_index}**")
+                        width = max(len(r) for r in content)
+                        padded = [r + [""] * (width - len(r)) for r in content]
+                        df = pd.DataFrame(padded)
+                        st.dataframe(
+                            df,
+                            use_container_width=True,
+                            hide_index=True
+                        )
 
         else:
             st.warning("Định dạng chưa hỗ trợ xem trước.")
 
     except Exception as e:
         st.error(f"Không thể xem trước chứng từ: {str(e)}")
+
 
 
 # =========================================================
