@@ -1,2 +1,5 @@
+streamlit
+pandas
+openpyxl
 pytesseract
-Pilloww
+Pillow
