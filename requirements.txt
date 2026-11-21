@@ -1,7 +1,2 @@
-streamlit
-pandas
-openpyxl
-pillow
-openai
-streamlit-drawable-canvas
-pymupdf
+pytesseract
+Pilloww
