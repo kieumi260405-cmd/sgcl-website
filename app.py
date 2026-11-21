@@ -1,4 +1,4 @@
-pip install pymupdf
+
 import streamlit as st
 import uuid
 from datetime import datetime
