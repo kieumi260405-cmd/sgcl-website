@@ -15,7 +15,6 @@ import sys
 import re
 import json
 import pandas as pd
-import numpy as np
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 os.environ["LANG"] = "C.UTF-8"
@@ -227,16 +226,26 @@ def format_size(size):
 # 2. XEM TRƯỚC CHỨNG TỪ
 # =========================================================
 
+def sgcl_safe_zoom(page, zoom, max_side=2200):
+    """
+    Giới hạn kích thước ảnh render. Bản scan thường có trang rất lớn
+    (VD 2480x3508 điểm); phóng to thêm sẽ tạo ảnh hàng trăm MB và làm
+    app hết RAM rồi bị tắt.
+    """
+    rect = page.rect
+    longest = max(rect.width, rect.height, 1)
+    return max(0.2, min(zoom, max_side / longest))
+
+
 @st.cache_data(show_spinner=False)
 def render_pdf_pages(file_bytes, zoom=1.6):
     """Chuyển các trang PDF thành ảnh PNG."""
     images = []
 
     with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
-        matrix = fitz.Matrix(zoom, zoom)
-
         for page in pdf:
-            pix = page.get_pixmap(matrix=matrix)
+            z = sgcl_safe_zoom(page, zoom, max_side=1800)
+            pix = page.get_pixmap(matrix=fitz.Matrix(z, z))
             images.append(pix.tobytes("png"))
 
     return images
@@ -332,7 +341,8 @@ def sgcl_render_pages(file_bytes, file_name):
     images = []
     with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
         for page in pdf:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            z = sgcl_safe_zoom(page, 2, max_side=2200)
+            pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
             images.append(Image.open(BytesIO(pix.tobytes("png"))).convert("RGB"))
     return images
 
@@ -982,40 +992,53 @@ def sgcl_tesseract_languages():
     return "+".join(selected) if selected else "eng"
 
 
-def sgcl_remove_table_lines(image, min_len_ratio=0.06):
-    """Xóa đường kẻ ngang/dọc dài (khung bảng) để OCR không bỏ sót chữ trong ô."""
+def sgcl_remove_table_lines(image):
+    """
+    Xóa đường kẻ ngang/dọc dài (khung bảng) để OCR không bỏ sót chữ trong ô.
+    Xử lý từng trục với kiểu dữ liệu nhỏ để giữ RAM thấp.
+    """
+    import numpy as np
+
     gray = np.asarray(image.convert("L"))
     dark = gray < 160
+    del gray
     h, w = dark.shape
 
-    def run_mask(mask, length, axis):
-        if length < 2 or mask.shape[axis] < length:
-            return np.zeros_like(mask)
-        m = mask.astype(np.int32)
-        c = np.cumsum(m, axis=axis)
-        pad_shape = list(m.shape); pad_shape[axis] = 1
-        c = np.concatenate([np.zeros(pad_shape, np.int32), c], axis=axis)
-        hi = np.take(c, range(length, c.shape[axis]), axis=axis)
-        lo = np.take(c, range(0, c.shape[axis] - length), axis=axis)
-        full = (hi - lo) == length          # cửa sổ bắt đầu tại i toàn điểm tối
-        f = full.astype(np.int32)
-        cf = np.cumsum(f, axis=axis)
-        cf = np.concatenate([np.zeros(pad_shape, np.int32), cf], axis=axis)
-        # điểm j thuộc đường nếu có cửa sổ bắt đầu trong [j-length+1, j]
-        n = m.shape[axis]
-        idx_hi = np.minimum(np.arange(n) + 1, f.shape[axis])
-        idx_lo = np.maximum(np.arange(n) - length + 1, 0)
-        covered = np.take(cf, idx_hi, axis=axis) - np.take(cf, idx_lo, axis=axis)
-        return covered > 0
+    def line_mask(mask, length):
+        """Đánh dấu điểm thuộc đoạn tối liên tục dài >= length theo trục ngang."""
+        n = mask.shape[1]
+        if length < 2 or n < length:
+            return np.zeros(mask.shape, dtype=bool)
+        csum = np.zeros((mask.shape[0], n + 1), dtype=np.int32)
+        np.cumsum(mask, axis=1, dtype=np.int32, out=csum[:, 1:])
+        # span[i] = có cửa sổ dài `length` toàn điểm tối bắt đầu tại i
+        span = np.zeros(mask.shape, dtype=bool)
+        span[:, :n - length + 1] = (csum[:, length:] - csum[:, :-length]) == length
+        del csum
+        # Điểm j thuộc đường nếu có cửa sổ bắt đầu trong [j-length+1, j]
+        covered = 1
+        while covered < length:
+            step = min(covered, length - covered)
+            span[:, step:] |= span[:, :-step].copy()
+            covered += step
+        return span
 
-    lines = run_mask(dark, max(80, int(w * min_len_ratio)), 1) | run_mask(dark, max(60, int(h * 0.02)), 0)
+    horizontal = line_mask(dark, max(80, int(w * 0.06)))
+    vertical = line_mask(dark.T, max(60, int(h * 0.02))).T
+    del dark
+    lines = horizontal | vertical
+    del horizontal, vertical
     if not lines.any():
         return image
-    out = np.asarray(image.convert("RGB")).copy()
+
     # nới rộng 1 px để xóa cả viền mờ
     grown = lines.copy()
-    grown[1:, :] |= lines[:-1, :]; grown[:-1, :] |= lines[1:, :]
-    grown[:, 1:] |= lines[:, :-1]; grown[:, :-1] |= lines[:, 1:]
+    grown[1:, :] |= lines[:-1, :]
+    grown[:-1, :] |= lines[1:, :]
+    grown[:, 1:] |= lines[:, :-1]
+    grown[:, :-1] |= lines[:, 1:]
+    del lines
+    out = np.array(image.convert("RGB"))
     out[grown] = 255
     return Image.fromarray(out)
 
@@ -1030,6 +1053,8 @@ def sgcl_ocr_page(file_bytes, page_number, dpi_scale=3):
 
     with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
         page = pdf[page_number - 1]
+        # ~3300 px cạnh dài ≈ 300 dpi khổ A4: đủ nét cho OCR, không quá tải RAM
+        dpi_scale = sgcl_safe_zoom(page, dpi_scale, max_side=3300)
         pix = page.get_pixmap(matrix=fitz.Matrix(dpi_scale, dpi_scale), alpha=False)
         image = Image.open(BytesIO(pix.tobytes("png"))).convert("RGB")
 
@@ -3250,8 +3275,9 @@ else:
                         filetype="pdf"
                     ) as pdf:
                         page = pdf[int(page_number) - 1]
+                        z = sgcl_safe_zoom(page, 1.5, max_side=1800)
                         pix = page.get_pixmap(
-                            matrix=fitz.Matrix(1.5, 1.5),
+                            matrix=fitz.Matrix(z, z),
                             alpha=False
                         )
                         st.image(
