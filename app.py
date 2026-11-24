@@ -992,7 +992,58 @@ def sgcl_tesseract_languages():
     return "+".join(selected) if selected else "eng"
 
 
-def sgcl_remove_table_lines(image):
+def sgcl_deskew(image, max_angle=4.0, step=0.25):
+    """
+    Chỉnh thẳng ảnh chụp/scan bị nghiêng nhẹ. Thử các góc nhỏ trên ảnh thu
+    nhỏ, chọn góc làm các dòng chữ/đường kẻ thẳng hàng nhất.
+    """
+    import numpy as np
+
+    small = image.convert("L")
+    ratio = 900 / max(small.width, 1)
+    if ratio < 1:
+        small = small.resize((max(1, int(small.width * ratio)), max(1, int(small.height * ratio))))
+    mask = small.point(lambda v: 255 if v < 160 else 0)
+
+    def score(angle):
+        rotated = np.asarray(mask.rotate(angle, fillcolor=0), dtype=np.float32)
+        rows = rotated.sum(axis=1)
+        return float(((rows[1:] - rows[:-1]) ** 2).sum())
+
+    angles = [round(-max_angle + i * step, 3) for i in range(int(2 * max_angle / step) + 1)]
+    scores = {a: score(a) for a in angles}
+    best = max(scores, key=scores.get)
+    # Tinh chỉnh quanh góc tốt nhất
+    for a in (best - step / 2, best + step / 2):
+        scores[a] = score(a)
+    best = max(scores, key=scores.get)
+    if abs(best) < 0.2 or scores[best] <= scores.get(0.0, 0) * 1.02:
+        return image
+    return image.rotate(best, resample=Image.BICUBIC, fillcolor=(255, 255, 255))
+
+
+def sgcl_line_positions(mask, axis, min_len):
+    """
+    Từ mặt nạ đường kẻ, trả về danh sách đường: (vị trí giữa, đầu, cuối).
+    axis=0: đường ngang (vị trí = y, đầu/cuối = x); axis=1: đường dọc.
+    """
+    import numpy as np
+
+    counts = mask.sum(axis=1 if axis == 0 else 0)
+    idx = np.nonzero(counts >= min_len)[0]
+    lines = []
+    if idx.size == 0:
+        return lines
+    groups = np.split(idx, np.nonzero(np.diff(idx) > 3)[0] + 1)
+    for g in groups:
+        band = mask[g[0]:g[-1] + 1, :] if axis == 0 else mask[:, g[0]:g[-1] + 1]
+        along = np.nonzero(band.any(axis=0 if axis == 0 else 1))[0]
+        if along.size:
+            lines.append(((g[0] + g[-1]) / 2.0, float(along[0]), float(along[-1])))
+    return lines
+
+
+def sgcl_remove_table_lines(image, return_lines=False):
     """
     Xóa đường kẻ ngang/dọc dài (khung bảng) để OCR không bỏ sót chữ trong ô.
     Xử lý từng trục với kiểu dữ liệu nhỏ để giữ RAM thấp.
@@ -1026,10 +1077,14 @@ def sgcl_remove_table_lines(image):
     horizontal = line_mask(dark, max(80, int(w * 0.06)))
     vertical = line_mask(dark.T, max(60, int(h * 0.02))).T
     del dark
+    grid = {
+        "h": sgcl_line_positions(horizontal, 0, max(80, int(w * 0.06))),
+        "v": sgcl_line_positions(vertical, 1, max(60, int(h * 0.02))),
+    }
     lines = horizontal | vertical
     del horizontal, vertical
     if not lines.any():
-        return image
+        return (image, grid) if return_lines else image
 
     # nới rộng 1 px để xóa cả viền mờ
     grown = lines.copy()
@@ -1040,7 +1095,64 @@ def sgcl_remove_table_lines(image):
     del lines
     out = np.array(image.convert("RGB"))
     out[grown] = 255
-    return Image.fromarray(out)
+    result = Image.fromarray(out)
+    return (result, grid) if return_lines else result
+
+
+def sgcl_ocr_words(image, psm, dpi_scale):
+    """Chạy Tesseract với một chế độ phân tích trang, trả về từ theo tọa độ PDF."""
+    import pytesseract
+    from pytesseract import Output
+
+    data = pytesseract.image_to_data(
+        image, lang=sgcl_tesseract_languages(),
+        config=f"--oem 3 --psm {psm}",
+        output_type=Output.DICT
+    )
+    words = []
+    for i, raw in enumerate(data.get("text", [])):
+        word = str(raw or "").strip()
+        try:
+            confidence = float(data["conf"][i])
+        except Exception:
+            confidence = -1
+        # Bỏ ký tự rác do đường kẻ còn sót
+        if not word or confidence < 0 or re.fullmatch(r"[|\[\]_—–\-]+", word):
+            continue
+        left, top = int(data["left"][i]), int(data["top"][i])
+        width, height = int(data["width"][i]), int(data["height"][i])
+        words.append(((
+            left / dpi_scale, top / dpi_scale,
+            (left + width) / dpi_scale, (top + height) / dpi_scale, word
+        ), confidence))
+    return words
+
+
+def sgcl_merge_ocr_words(primary, extra):
+    """
+    Ghép hai lần OCR (mỗi phần tử: (từ, độ_tin_cậy)). Từ của lần phụ được
+    thêm khi lần chính bỏ sót chỗ đó, hoặc thay thế khi lần chính đọc ra chữ
+    rác (độ tin cậy thấp hơn hẳn) ở cùng vị trí.
+    """
+    def overlaps(w, p):
+        ix = min(w[2], p[2]) - max(w[0], p[0])
+        iy = min(w[3], p[3]) - max(w[1], p[1])
+        if ix <= 0 or iy <= 0:
+            return False
+        smaller = min((w[2] - w[0]) * (w[3] - w[1]), (p[2] - p[0]) * (p[3] - p[1])) or 1
+        return ix * iy >= 0.3 * smaller
+
+    result = list(primary)
+    for w, conf in extra:
+        hits = [k for k, (p, _) in enumerate(result) if overlaps(w, p)]
+        if not hits:
+            result.append((w, conf))
+            continue
+        best_existing = max(result[k][1] for k in hits)
+        if conf >= best_existing + 25 and conf >= 60:
+            result = [item for k, item in enumerate(result) if k not in hits]
+            result.append((w, conf))
+    return result
 
 
 def sgcl_ocr_page(file_bytes, page_number, dpi_scale=3):
@@ -1059,32 +1171,41 @@ def sgcl_ocr_page(file_bytes, page_number, dpi_scale=3):
         image = Image.open(BytesIO(pix.tobytes("png"))).convert("RGB")
 
     try:
-        image = sgcl_remove_table_lines(image)
+        image = sgcl_deskew(image)
     except Exception:
         pass
 
-    data = pytesseract.image_to_data(
-        image, lang=sgcl_tesseract_languages(), config="--oem 3 --psm 6",
-        output_type=Output.DICT
-    )
-    words = []
-    for i, raw in enumerate(data.get("text", [])):
-        word = str(raw or "").strip()
-        try:
-            confidence = float(data["conf"][i])
-        except Exception:
-            confidence = -1
-        # Bỏ ký tự rác do đường kẻ còn sót
-        if not word or confidence < 0 or re.fullmatch(r"[|\[\]_—–\-]+", word):
-            continue
-        left, top = int(data["left"][i]), int(data["top"][i])
-        width, height = int(data["width"][i]), int(data["height"][i])
-        words.append((
-            left / dpi_scale, top / dpi_scale,
-            (left + width) / dpi_scale, (top + height) / dpi_scale, word
-        ))
+    grid = {"h": [], "v": []}
+    try:
+        image, grid = sgcl_remove_table_lines(image, return_lines=True)
+    except Exception:
+        pass
 
-    return sgcl_words_to_rows(words), words
+    # psm 6 đọc bảng ổn định; psm 3 (tự động) bổ sung chữ bị bỏ sót, thường
+    # là hàng tiêu đề bảng hoặc khối chữ nằm tách rời.
+    scored = sgcl_ocr_words(image, 6, dpi_scale)
+    try:
+        scored = sgcl_merge_ocr_words(scored, sgcl_ocr_words(image, 3, dpi_scale))
+    except Exception:
+        pass
+    words = [w for w, _ in scored]
+
+    # Bỏ "chữ" quá nhỏ so với cỡ chữ thường (vết bẩn, dấu chấm rời)
+    if words:
+        heights = sorted(w[3] - w[1] for w in words)
+        median_h = heights[len(heights) // 2]
+        words = [
+            w for w in words
+            if (w[3] - w[1]) >= median_h * 0.45
+            or (len(re.sub(r"[^A-Za-z0-9]", "", w[4])) >= 2 and (w[3] - w[1]) >= median_h * 0.3)
+        ]
+
+    # Đổi tọa độ đường kẻ về tọa độ trang PDF
+    grid = {
+        "h": [(y / dpi_scale, a / dpi_scale, b / dpi_scale) for y, a, b in grid.get("h", [])],
+        "v": [(x / dpi_scale, a / dpi_scale, b / dpi_scale) for x, a, b in grid.get("v", [])],
+    }
+    return sgcl_words_to_rows(words), words, grid
 
 
 def sgcl_ocr_page_text(file_bytes, page_number, dpi_scale=3):
@@ -1103,7 +1224,7 @@ def sgcl_get_all_pdf_text(file_bytes):
         needs_ocr = len(visible) < 35 or alpha_num < max(12, len(visible) * 0.35)
         if needs_ocr:
             try:
-                item["text"], item["words"] = sgcl_ocr_page(file_bytes, item["page"])
+                item["text"], item["words"], item["grid"] = sgcl_ocr_page(file_bytes, item["page"])
                 item["tables"] = []
                 item["source_type"] = "OCR"
             except Exception as e:
@@ -1174,7 +1295,22 @@ SGCL_FIELD_ALIASES = {
     "Number of persons on board": ["Number of persons on board", "Persons on board"],
     "Period of stay": ["Period of stay"],
     "This certificate is valid until": ["This certificate is valid until", "valid until"],
+    "Notify Party": ["Notify address", "Notify"],
+    "Shipper’s Description of Goods": [
+        "Shippers description of goods", "Description of goods", "Shippers description",
+    ],
+    "Consignee": ["Consigned to order of"],
 }
+
+# Nhãn hay gặp trên chứng từ tàu: luôn coi là nhãn, không bao giờ là giá trị
+SGCL_COMMON_LABELS = [
+    "Name of ship", "Call sign", "IMO number", "Flag", "Flag state",
+    "Port of arrival", "Port of arrival/departure", "Date of arrival",
+    "Date of arrival/departure", "Voyage number", "Voyage No",
+    "Next port of call", "Last port of call", "Port of registry",
+    "Nationality", "Rank or rating", "Family name", "Passport No",
+    "Page No", "Arrival", "Departure", "Gross tonnage", "Net tonnage",
+]
 
 # Trường có nội dung nhiều dòng (khối địa chỉ, mô tả hàng)
 SGCL_BLOCK_FIELDS = {
@@ -1235,12 +1371,23 @@ def _sgcl_label_body(label, loose=False):
         return ""
     # Nhãn 1 từ ngắn (VD 'Port', 'Unit') không nới lỏng để tránh bắt nhầm
     loose = loose and (len(tokens) >= 2 or len(tokens[0]) >= 6)
-    return r"[\W_]*".join(_sgcl_fuzzy_token(t, loose) for t in tokens)
+    parts = []
+    for t in tokens:
+        if loose and len(tokens) >= 3 and 2 <= len(t) < 4 and not t.isdigit():
+            # từ ngắn trong nhãn dài: cho sai 1 ký tự
+            variants = [t] + [t[:i] + "." + t[i + 1:] for i in range(len(t))]
+            parts.append("(?:" + "|".join(v.replace(".", "[A-Za-z0-9]") if v != t
+                                          else re.escape(v) for v in variants) + ")")
+        else:
+            parts.append(_sgcl_fuzzy_token(t, loose))
+    return r"[\W_]*".join(parts)
 
 
 def _sgcl_label_regex(label, loose=False):
     body = _sgcl_label_body(label, loose)
-    return re.compile(rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])", re.I) if body else None
+    return re.compile(
+        rf"(?<![A-Za-z0-9])(?<![A-Za-z]\.){body}(?![A-Za-z0-9])(?!\.[A-Za-z])", re.I
+    ) if body else None
 
 
 def _sgcl_ocr_key(text):
@@ -1266,7 +1413,9 @@ class SgclLabelSet:
                 "key": _sgcl_ocr_key(label),
                 "tokens": len(tokens),
                 "full": re.compile(rf"^[\W_]*{body}[\W_]*$", re.I),
-                "search": re.compile(rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])", re.I),
+                "search": re.compile(
+                    rf"(?<![A-Za-z0-9])(?<![A-Za-z]\.){body}(?![A-Za-z0-9])(?!\.[A-Za-z])", re.I
+                ),
             })
 
     def is_label(self, text):
@@ -1276,6 +1425,14 @@ class SgclLabelSet:
         if self.starts_with_label(text):
             return True
         first = text.splitlines()[0].strip()
+        # Mục đánh số của biểu mẫu: "15. Cảng đến / Port of arrival"
+        if re.match(r"^\(?\d{1,2}(\.\d{1,2})?[.)]\s*[^\d\s]", first):
+            return True
+        # Nhãn song ngữ không có số: "Cấp tại / Issued at"
+        if (" / " in first or "/" in first) and not re.search(r"\d", first) \
+                and re.search(r"[a-zà-ỹđ]", first) and any(ord(ch) > 127 for ch in first) \
+                and len(first) <= 80:
+            return True
         for item in self.items:
             if item["full"].match(text) or item["full"].match(first):
                 return True
@@ -1318,6 +1475,44 @@ class SgclLabelSet:
         return text[:cut].strip()
 
 
+def sgcl_cut_trailing_label(text):
+    """
+    Cắt phần nhãn của trường khác dính phía sau giá trị, VD
+    'HAI PHONG Ngày / Date: 15/06/2023' -> 'HAI PHONG';
+    'YES Cấp tại / Issued at: ...' -> 'YES'.
+    """
+    original = text
+    # Nhãn song ngữ "Tiếng Việt / English:"
+    m = re.search(r"(?:^|\s+)(?:[^\s/:]+\s+){0,4}[^\s/:]+\s*/\s*[A-Za-z][A-Za-z .,'’()]{1,40}[:：]", text)
+    if m:
+        # Bỏ qua các từ VIẾT HOA không dấu ở đầu đoạn khớp (thuộc giá trị)
+        start = m.start()
+        for tok in re.finditer(r"\S+", text[m.start():m.end()]):
+            word = tok.group()
+            if re.fullmatch(r"[A-Z0-9,.\-]+", word):
+                start = m.start() + tok.end()
+            else:
+                break
+        text = text[:start]
+    # Nhãn tiếng Anh viết hoa chữ đầu "Date:" "Issued at:"
+    m = re.search(r"\s+[A-Z][a-z]+(?:\s+[a-z]+){0,3}[:：](?:\s|$)", text)
+    if m and m.start() > 0:
+        text = text[:m.start()]
+    # Giá trị bắt đầu bằng số mà sau đó là câu văn: '13/06/2031 subject to ...'
+    tokens = text.split(" ")
+    if tokens and re.match(r"\d", tokens[0]):
+        for k, tok in enumerate(tokens[1:], start=1):
+            rest = tokens[k:]
+            # chỉ cắt khi phía sau là câu văn (>= 3 từ, từ thứ hai cũng viết thường)
+            if (len(tok) >= 3 and tok[:1].isalpha() and tok[:1].islower()
+                    and len(rest) >= 3 and rest[1][:1].islower()):
+                text = " ".join(tokens[:k])
+                break
+    if text != original:
+        return text.strip(" ,;/–-")
+    return text.strip()
+
+
 def sgcl_clean_value(text, label_set=None):
     """Làm sạch giá trị: bỏ dấu ':' đầu, phần dịch nhãn '/ Tên tàu:', ngoặc chú thích."""
     lines = []
@@ -1329,13 +1524,14 @@ def sgcl_clean_value(text, label_set=None):
 
     for _ in range(3):
         before = text
-        text = text.lstrip(" \t\n:：.-–—)]|")
+        text = text.lstrip(" \t\n:：.-–—)]|?")
         # Ngoặc chú thích ngay sau nhãn, VD "(F/A):" hoặc "(Người gửi hàng)"
         text = re.sub(r"^\([^)\d]{0,40}\)\s*", "", text)
         # Phần nhãn song ngữ trước dấu ':' VD "/ Tên tàu: HTP OCEAN"
         m = re.match(r"^([^:：\n\d]{0,45})[:：]\s*(.+)$", text, re.S)
+        first_word = (m.group(1).split() or [""])[0] if m else ""
         if m and (m.group(1).lstrip().startswith(("/", "(")) or
-                  any(ord(ch) > 127 for ch in m.group(1))):
+                  any(ord(ch) > 127 for ch in first_word) or first_word[:1].islower()):
             text = m.group(2)
         if text == before:
             break
@@ -1348,6 +1544,15 @@ def sgcl_clean_value(text, label_set=None):
         first, *others = text.split("\n")
         first = label_set.cut_at_next_label(first)
         text = "\n".join([first] + others).strip()
+
+    kept = []
+    for i, line in enumerate(text.split("\n")):
+        cut = sgcl_cut_trailing_label(line)
+        if i > 0 and not cut and line.strip():
+            break   # dòng này là nhãn của trường khác
+        if cut:
+            kept.append(cut)
+    text = "\n".join(kept)
 
     return text.strip(" \t\n:：|")
 
@@ -1365,10 +1570,17 @@ def sgcl_build_lines(words):
     for w in items:
         yc = (w[1] + w[3]) / 2
         h = max(w[3] - w[1], 1.0)
-        if lines and abs(lines[-1]["yc"] - yc) <= max(2.5, h * 0.45):
-            lines[-1]["words"].append(w)
-        else:
-            lines.append({"yc": yc, "words": [w]})
+        if lines:
+            last = lines[-1]
+            tol = max(2.5, max(h, last["hsum"] / len(last["words"])) * 0.5)
+            if abs(last["yc"] - yc) <= tol:
+                last["words"].append(w)
+                # Tâm dòng = trung bình, chịu được chữ hơi lệch/nghiêng
+                n = len(last["words"])
+                last["yc"] += (yc - last["yc"]) / n
+                last["hsum"] += h
+                continue
+        lines.append({"yc": yc, "words": [w], "hsum": h})
 
     for line in lines:
         ws = sorted(line["words"], key=lambda w: w[0])
@@ -1408,7 +1620,7 @@ def _join_words(ws):
     return " ".join(str(w[4]) for w in ws)
 
 
-def _find_label_hits(lines, label, loose=False):
+def _find_label_hits(lines, label, loose=False, multiline_min=3):
     """Tìm vị trí nhãn; hỗ trợ nhãn dài bị xuống dòng trong cùng một cột."""
     regex = _sgcl_label_regex(label, loose)
     if regex is None:
@@ -1421,12 +1633,20 @@ def _find_label_hits(lines, label, loose=False):
                 continue
             last = idx[-1]
             tail = line["text"][m.end():line["spans"][last][1]]
+            before = line["text"][max(0, m.start() - 60):m.start()]
+            if before.count("(") > before.count(")"):
+                # Nhãn nằm trong ngoặc "(Time of Arrival – E.O.S.P)":
+                # phần còn lại trong ngoặc vẫn là tiêu đề, không phải giá trị
+                close = next((k for k in range(last, len(line["words"]))
+                              if ")" in str(line["words"][k][4])), None)
+                if close is not None:
+                    last, tail = close, ""
             hits.append({
                 "words": [(li, k) for k in idx],
                 "right": [(li, last + 1, tail)],
                 "first_line": li,
             })
-    if hits or len(sgcl_label_tokens(label)) < 3:
+    if hits or len(sgcl_label_tokens(label)) < multiline_min:
         return hits
 
     # Nhãn dài xuống 2-3 dòng trong cùng cột
@@ -1514,10 +1734,17 @@ def _below_value(lines, hit, label_set, multiline):
     # Biên cột: nửa khoảng cách tới đoạn bên trái/phải trên dòng nhãn
     first_idx = [b for a, b in used if a == hit["first_line"]]
     s, e = _seg_of(first, first_idx[0])
+    # Nhãn song ngữ "Tiếng Việt / English": cột bắt đầu từ đầu cụm nhãn
+    lx0 = min(lx0, first["words"][s][0])
     left = first["words"][s - 1][2] if s > 0 else None
     right = first["words"][e][0] if e < len(first["words"]) else None
     col_l = (left + lx0) / 2 if left is not None else lx0 - 3 * h
-    col_r = (lx1 + right) / 2 if right is not None else float("inf")
+    if right is None:
+        col_r = float("inf")
+    elif multiline:
+        col_r = right - h * 0.5   # khối địa chỉ có thể dài hơn nhãn
+    else:
+        col_r = (lx1 + right) / 2
 
     def in_col(w):
         width = max(w[2] - w[0], 0.1)
@@ -1525,12 +1752,24 @@ def _below_value(lines, hit, label_set, multiline):
         return overlap >= width * 0.5
 
     collected, skipped, last_y1 = [], 0, bottom
+    block_x0 = None
     last_line = max(a for a, _ in used)
     for lj in range(last_line + 1, len(lines)):
         line = lines[lj]
         if line["y0"] - last_y1 > h * (1.6 if collected else 4.5):
             break
         ws = [w for w in line["words"] if in_col(w)]
+        if ws and multiline:
+            # Dừng ở khoảng trống rất lớn (sang cột/khối khác cùng dòng)
+            run = [ws[0]]
+            for w in ws[1:]:
+                if w[0] - run[-1][2] > max(h * 4, 30):
+                    break
+                run.append(w)
+            ws = run
+            # Các dòng sau của khối phải thẳng lề trái với dòng đầu
+            if collected and abs(ws[0][0] - block_x0) > h * 3:
+                break
         if not ws:
             if collected:
                 break
@@ -1544,6 +1783,8 @@ def _below_value(lines, hit, label_set, multiline):
                 break
             last_y1 = line["y1"]
             continue
+        if not collected:
+            block_x0 = ws[0][0]
         collected.append(text)
         last_y1 = line["y1"]
         if not multiline or len(collected) >= 6:
@@ -1574,20 +1815,32 @@ def _value_from_tables(tables, labels, label_set):
                         continue
                     if sum(ch.isalnum() for ch in text[:m.start()]) > 30:
                         continue
-                    rest = sgcl_clean_value(text[m.end():], label_set)
+                    after = text[m.end():]
+                    before = text[:m.start()]
+                    if before.count("(") > before.count(")") and ")" in after:
+                        after = after[after.index(")") + 1:]
+                    rest = sgcl_clean_value(after, label_set)
                     if rest and not label_set.is_label(rest):
                         return rest
+                    right_cand = ""
                     for c2 in range(c + 1, len(row)):
                         if row[c2] and str(row[c2][1]).strip():
-                            cand = sgcl_clean_value(row[c2][1], label_set)
-                            if cand and not label_set.is_label(cand):
-                                return cand
+                            right_cand = sgcl_clean_value(row[c2][1], label_set)
+                            if label_set.is_label(right_cand):
+                                right_cand = ""
                             break
+                    below_cand = ""
                     below = _cell_below(grid, r, bbox)
                     if below:
-                        cand = sgcl_clean_value(below[1], label_set)
-                        if cand and not label_set.is_label(cand):
-                            return cand
+                        below_cand = sgcl_clean_value(below[1], label_set)
+                        if label_set.is_label(below_cand):
+                            below_cand = ""
+                    # Ô phải toàn chữ còn ô dưới có số -> nhãn nằm ở hàng tiêu đề
+                    if (right_cand and below_cand and not re.search(r"\d", right_cand)
+                            and re.search(r"\d", below_cand)):
+                        return below_cand
+                    if right_cand or below_cand:
+                        return right_cand or below_cand
                     break
     return ""
 
@@ -1603,9 +1856,11 @@ def sgcl_extract_single(pages, field_name, other_fields=None):
     """
     labels = sgcl_field_labels(field_name)
     all_labels = list(labels)
-    for name in other_fields or []:
+    for name in list(other_fields or []) + SGCL_COMMON_LABELS:
         all_labels += sgcl_field_labels(name)
     label_set = SgclLabelSet(all_labels)
+    field_tokens = {t.lower() for t in sgcl_label_tokens(field_name)}
+    numeric_field = bool(field_tokens & {"imo", "number", "no", "weight"})
     multiline = sgcl_normalize(field_name) in SGCL_BLOCK_FIELDS
 
     best = None  # (điểm, thứ tự, giá trị, trang)
@@ -1614,6 +1869,16 @@ def sgcl_extract_single(pages, field_name, other_fields=None):
     def consider(score, value, page_no):
         nonlocal best, order
         order += 1
+        if not multiline and value:
+            value = re.sub(r"\s*\n\s*", " ", value).strip()
+        if numeric_field and value and not re.match(r"\S*\d", value):
+            # 'SAID TO WEIGHT: 2200 MT' -> '2200 MT'
+            m = re.search(r"\S*\d", value)
+            if m and m.start() > 0:
+                value = value[m.start():]
+        # Trường số (IMO, số B/L...) mà giá trị không có chữ số -> ít tin cậy
+        if numeric_field and value and not re.search(r"\d", value):
+            score -= 2.5
         if value and (best is None or score > best[0]):
             best = (score, order, value, page_no)
 
@@ -1651,13 +1916,18 @@ def sgcl_extract_single(pages, field_name, other_fields=None):
                         continue
 
                     below = _below_value(lines, hit, label_set, multiline)
+                    if multiline and right and right[:1].islower() and not separated:
+                        right = ""   # phần đuôi của nhãn (VD 'of goods'), không phải giá trị
                     if multiline and (right or below):
                         value = "\n".join(x for x in (right, below) if x)
                         consider((3 if separated or below else 1) + bonus, value, page["page"])
-                    elif below:
-                        consider(2 + bonus, below, page["page"])
-                    elif right:
-                        consider(1 + bonus, right, page["page"])
+                    else:
+                        if below:
+                            consider(2 + bonus, below, page["page"])
+                        if right:
+                            # Không có ':' nhưng bắt đầu bằng số/ngày -> vẫn khá tin cậy
+                            score = 2.8 if re.match(r"\d", right) else 1
+                            consider(score + bonus, right, page["page"])
 
     if best:
         return {"value": best[2], "page": best[3], "found": True}
@@ -1717,7 +1987,301 @@ def sgcl_is_header_row(row, headers):
     return hits * 2 > len(cells)
 
 
-def sgcl_extract_table_from_pdf(file_bytes, headers):
+# Nhãn tiêu đề cột thường gặp trên bản khai (bổ sung cho tên trường)
+SGCL_TABLE_HEADER_ALIASES = {
+    "rankorrating": ["Rank of rating", "Rank", "Capacity"],
+    "familynamegivenname": ["Family name, given names", "Family name", "Name"],
+    "familynamegivennames": ["Family name, given name", "Family name", "Name"],
+    "dateandplaceofbirthddmmyyyy": ["Date and place of birth", "Date of birth"],
+    "passportnoandpassportexpiredate": ["Passport No", "Passport number", "Passport"],
+    "nameofarticle": ["Name of article", "Description", "Article"],
+    "placeofstorage": ["Place of storage", "Location"],
+    "dateofarrival": ["Arrival"],
+    "dateofdeparture": ["Departure"],
+}
+
+
+def _sgcl_header_hit(lines, header, max_y=None):
+    """Vị trí tiêu đề cột: (x0, x1, y0, y1) hoặc None."""
+    labels = sgcl_field_labels(header)
+    for alias in SGCL_TABLE_HEADER_ALIASES.get(sgcl_normalize(header), []):
+        if alias not in labels:
+            labels.append(alias)
+    for label in labels:
+        for loose in (False, True):
+            # Tiêu đề 2 từ có thể bị xuống dòng, VD "Passport" / "No"
+            hits = _find_label_hits(lines, label, loose, multiline_min=2)
+            for hit in hits:
+                ws = [lines[a]["words"][b] for a, b in hit["words"]]
+                box = (min(w[0] for w in ws), max(w[2] for w in ws),
+                       min(w[1] for w in ws), max(w[3] for w in ws))
+                if max_y is None or box[2] <= max_y:
+                    return box
+    return None
+
+
+def sgcl_fix_date_token(token):
+    """'02021972' -> '02/02/1972'; '09/112031' -> '09/11/2031'; '5/4/2031' -> '05/04/2031'."""
+    digits = re.sub(r"\D", "", token)
+    if not re.fullmatch(r"[\d/.\-]{6,10}", token) or len(digits) not in (6, 7, 8):
+        return token
+    parts = [p for p in re.split(r"[/.\-]", token) if p]
+    candidates = []
+    if len(parts) == 3:
+        candidates.append(parts)
+    if len(digits) == 8:
+        candidates.append([digits[:2], digits[2:4], digits[4:]])
+    for d, m, y in candidates:
+        if len(y) == 4 and 1 <= int(d or 0) <= 31 and 1 <= int(m or 0) <= 12 and 1900 <= int(y) <= 2100:
+            return f"{int(d):02d}/{int(m):02d}/{y}"
+    return token
+
+
+def sgcl_fix_passport_token(token):
+    """Lỗi OCR trong số hộ chiếu: 'COl2I147' -> 'C0121147'."""
+    m = (re.fullmatch(r"([A-Z])([0-9OIlSB]{6,9})", token)
+         or re.fullmatch(r"([A-Z]{2})([0-9OIlSB]{6,9})", token))
+    if not m or not re.search(r"\d", m.group(2)):
+        return token
+    return m.group(1) + m.group(2).translate(str.maketrans("OIlSB", "01158"))
+
+
+def sgcl_clean_table_rows(rows, headers):
+    """Chuẩn hóa ngày tháng, số hộ chiếu, chữ hoa theo cột; bỏ ký tự rác."""
+    cleaned = []
+    for row in rows:
+        new_row = []
+        for header, cell in zip(headers, row):
+            tokens = []
+            for tok in str(cell or "").split():
+                # ký tự rác ngắn không có chữ/số Latin
+                if len(tok) <= 2 and not re.search(r"[A-Za-z0-9]", tok):
+                    continue
+                # dấu câu thừa ở hai đầu: '(9538378', '10/02/1983.'
+                if not re.fullmatch(r"\(.*\)", tok):
+                    tok = tok.strip("()[]{}.,;:'`‘’\"|")
+                if not tok:
+                    continue
+                tok = sgcl_fix_date_token(tok)
+                if "passport" in sgcl_normalize(header):
+                    tok = sgcl_fix_passport_token(tok)
+                tokens.append(tok)
+            new_row.append(" ".join(tokens))
+        cleaned.append(new_row)
+
+    # Cột đa số viết HOA -> viết hoa các ô còn lại (VD 'co' -> 'CO')
+    for c in range(len(headers)):
+        values = [r[c] for r in cleaned if r[c]]
+        upper = [v for v in values if v == v.upper()]
+        if values and len(upper) >= len(values) * 0.7:
+            for r in cleaned:
+                r[c] = r[c].upper()
+    return cleaned
+
+
+def sgcl_split_crew_cell(header, value):
+    """
+    Mẫu NSW tách riêng: Họ | Tên (A|B), Ngày sinh | Nơi sinh (E|F),
+    Số hộ chiếu | Ngày hết hạn (H|I). Trả về [(lệch_cột, giá_trị)] hoặc None.
+    """
+    key = sgcl_normalize(header)
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return None
+    date_re = r"\d{2}/\d{2}/\d{4}"
+
+    if key.startswith("familyname"):
+        if "," in text:
+            family, given = [x.strip() for x in text.split(",", 1)]
+        else:
+            family, _, given = text.partition(" ")
+        return [(0, family), (1, given.strip())] if given.strip() else [(0, family)]
+
+    if "dateandplaceofbirth" in key:
+        m = re.search(date_re, text)
+        if m:
+            place = (text[:m.start()] + " " + text[m.end():]).strip(" ,;-")
+            return [(0, m.group()), (1, re.sub(r"\s+", " ", place))]
+        return None
+
+    if "passport" in key and "expire" in key:
+        dates = list(re.finditer(date_re, text))
+        if dates:
+            m = dates[-1]
+            number = (text[:m.start()] + " " + text[m.end():]).strip(" ,;-")
+            return [(0, re.sub(r"\s+", " ", number)), (1, m.group())]
+        return None
+
+    return None
+
+
+def sgcl_extract_table_layout(page, headers):
+    """
+    Tách bảng theo vị trí chữ (dùng cho bản scan/OCR):
+    - Tìm vị trí tiêu đề từng cột.
+    - Hàng: theo đường kẻ ngang của bảng; không có đường kẻ thì theo dòng chữ.
+    - Cột: theo đường kẻ dọc; cột phụ không có tiêu đề riêng (VD Nơi sinh,
+      Ngày hết hạn hộ chiếu) được gộp vào cột có tiêu đề bên trái nó.
+    Trả về danh sách dòng (mỗi dòng = list ô theo thứ tự headers) hoặc [].
+    """
+    words = page.get("words") or []
+    if not words or not headers:
+        return []
+    lines = page.get("_lines")
+    if lines is None:
+        lines = sgcl_build_lines(words)
+        page["_lines"] = lines
+
+    boxes = [_sgcl_header_hit(lines, h) for h in headers]
+    found = [b for b in boxes if b]
+    need = max(2, (len(headers) * 3 + 4) // 5)
+    if len(found) < need:
+        return []
+    is_crew = "familyname" in sgcl_normalize(headers[0])
+    if is_crew and boxes[0] is None:
+        return []
+
+    # Giữ các tiêu đề nằm cùng một dải ngang với tiêu đề chính
+    anchor = boxes[0] or found[0]
+    band_h = max(anchor[3] - anchor[2], 6)
+    boxes = [b if b and abs(b[2] - anchor[2]) <= band_h * 4 else None for b in boxes]
+    found = [b for b in boxes if b]
+    if len(found) < need:
+        return []
+    header_bottom = max(b[3] for b in found)
+    header_top = min(b[2] for b in found)
+    char_h = sorted(l["h"] for l in lines)[len(lines) // 2] if lines else 10
+
+    grid = page.get("grid") or {}
+    table_x0 = min(b[0] for b in found) - char_h * 6
+    table_x1 = max(b[1] for b in found) + char_h * 12
+    # Có đường kẻ ngang dưới tiêu đề -> lấy đúng bề ngang của bảng
+    spans = [(x0, x1) for y, x0, x1 in grid.get("h", [])
+             if y >= header_top - char_h * 3 and x0 <= min(b[0] for b in found)
+             and x1 >= max(b[1] for b in found)]
+    if spans:
+        table_x0 = min(table_x0, min(a for a, _ in spans) - char_h)
+        table_x1 = max(table_x1, max(b for _, b in spans) + char_h)
+
+    # ---------- CỘT ----------
+    order = sorted([(b[0], b[1], i) for i, b in enumerate(boxes) if b])
+    v_lines = sorted(
+        x for x, y0, y1 in grid.get("v", [])
+        if y1 > header_bottom + char_h and table_x0 <= x <= table_x1
+    )
+    bands = []
+    if len(v_lines) >= 3:
+        for a, b in zip(v_lines, v_lines[1:]):
+            if b - a > char_h:
+                bands.append((a, b))
+
+    def column_of(x0, x1):
+        cx = (x0 + x1) / 2
+        if bands:
+            band = next(((a, b) for a, b in bands if a <= cx <= b), None)
+            if band is None:
+                return None
+            best, best_overlap = None, 0
+            for hx0, hx1, i in order:
+                overlap = min(band[1], hx1) - max(band[0], hx0)
+                if overlap > best_overlap:
+                    best, best_overlap = i, overlap
+            if best is not None and best_overlap >= min(band[1] - band[0], 1) * 0.15:
+                return best
+            if best is not None and best_overlap > 0:
+                return best
+            # Cột phụ không có tiêu đề: thuộc tiêu đề gần nhất bên trái
+            left = [i for hx0, hx1, i in order if hx0 < band[0]]
+            if not left or band[1] <= order[0][0]:
+                return None
+            return max(left, key=lambda i: boxes[i][0])
+        # Không có đường kẻ dọc: chia biên giữa các tiêu đề
+        for k, (hx0, hx1, i) in enumerate(order):
+            lo = (order[k - 1][1] + hx0) / 2 if k else hx0 - char_h * 2
+            hi = (hx1 + order[k + 1][0]) / 2 if k + 1 < len(order) else float("inf")
+            if lo <= cx < hi:
+                return i
+        return None
+
+    # ---------- HÀNG ----------
+    data_words = [w for w in words if (w[1] + w[3]) / 2 > header_bottom + char_h * 0.3
+                  and table_x0 <= (w[0] + w[2]) / 2 <= table_x1]
+    h_lines = sorted(
+        y for y, x0, x1 in grid.get("h", [])
+        if y > header_top and x1 - x0 > (found[-1][1] - found[0][0]) * 0.5
+    )
+    row_bands = []
+    below = [y for y in h_lines if y >= header_bottom - char_h * 0.5]
+    if len(below) >= 3:
+        for a, b in zip(below, below[1:]):
+            if b - a > char_h * 0.8:
+                row_bands.append((a, b))
+
+    groups = []
+    if row_bands:
+        filled_bands = [(a, b) for a, b in row_bands
+                        if any(a <= (w[1] + w[3]) / 2 < b for w in data_words)]
+        heights = sorted(b - a for a, b in filled_bands) or [0]
+        typical = heights[len(heights) // 2]
+        started = False
+        for a, b in row_bands:
+            # Dải quá cao (vùng chữ ký, con dấu dưới bảng) -> hết bảng
+            if typical and b - a > typical * 2.2:
+                if started:
+                    break
+                continue
+            group = [w for w in data_words if a <= (w[1] + w[3]) / 2 < b]
+            if group:
+                started = True
+            groups.append(group)
+    else:
+        pitch_prev = None
+        for line in sgcl_build_lines(data_words):
+            if groups and pitch_prev is not None:
+                gap = line["y0"] - pitch_prev
+                if gap > char_h * 4:
+                    break
+            groups.append(line["words"])
+            pitch_prev = line["y1"]
+
+    rows = []
+    for group in groups:
+        cells = [[] for _ in headers]
+        for w in sorted(group, key=lambda w: w[0]):
+            col = column_of(w[0], w[2])
+            if col is not None:
+                cells[col].append(w)
+        row = []
+        for ws in cells:
+            # Trong ô: gom theo dòng (có dung sai) rồi đọc trái sang phải
+            cell_lines = []
+            for w in sorted(ws, key=lambda w: (w[1] + w[3]) / 2):
+                yc = (w[1] + w[3]) / 2
+                if cell_lines and abs(cell_lines[-1][0] - yc) <= char_h * 0.7:
+                    cell_lines[-1][1].append(w)
+                else:
+                    cell_lines.append([yc, [w]])
+            ws = [w for _, line_ws in cell_lines for w in sorted(line_ws, key=lambda w: w[0])]
+            text = " ".join(str(w[4]) for w in ws)
+            text = re.sub(r"\s+", " ", text).strip(" .,;:'`‘’\"|_-")
+            row.append(text)
+        filled = sum(1 for c in row if c)
+        if filled < max(2, len(headers) // 2):
+            if rows and not row_bands and filled:
+                # Dòng chữ bị xuống hàng: nối vào dòng trước
+                for i, c in enumerate(row):
+                    if c:
+                        rows[-1][i] = (rows[-1][i] + " " + c).strip()
+            continue
+        if is_crew and not row[0]:
+            continue
+        if sgcl_is_header_row(row, headers):
+            continue
+        rows.append(row)
+    return sgcl_clean_table_rows(rows, headers)
+
+
+def sgcl_extract_table_from_pdf(file_bytes, headers, page_numbers=None):
     """
     Dùng bộ nhận diện bảng của PyMuPDF (page.find_tables) cho bảng có kẻ ô
     như Crew List, Ship's Stores List. Chọn bảng có tiêu đề khớp nhiều
@@ -1728,6 +2292,8 @@ def sgcl_extract_table_from_pdf(file_bytes, headers):
 
     with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
         for page_index, page in enumerate(pdf, start=1):
+            if page_numbers is not None and page_index not in page_numbers:
+                continue
             if not hasattr(page, "find_tables"):
                 return None
             try:
@@ -1785,6 +2351,23 @@ def sgcl_extract_table_from_pdf(file_bytes, headers):
 
 
 def sgcl_extract_table(pages, headers, file_bytes=None):
+    result = _sgcl_extract_table(pages, headers, file_bytes)
+    if result.get("rows") or len(headers or []) != 1:
+        return result
+    # Một cột: nội dung thường viết liền sau nhãn, mỗi mục cách nhau ; hoặc xuống dòng
+    single = sgcl_extract_single(pages, headers[0])
+    if not single.get("value"):
+        return result
+    items = [x.strip(" ,.") for x in re.split(r"[;\n]+", single["value"]) if x.strip(" ,.")]
+    return {
+        "headers": headers,
+        "rows": [[x] for x in items],
+        "page": single["page"],
+        "found": bool(items),
+    }
+
+
+def _sgcl_extract_table(pages, headers, file_bytes=None):
     """
     Tách bảng từ PDF.
     1. Thử nhận diện bảng có kẻ ô bằng PyMuPDF.
@@ -1796,16 +2379,29 @@ def sgcl_extract_table(pages, headers, file_bytes=None):
     if not headers:
         return empty
 
-    # Bảng Crew List trên bản scan mẫu có nhiều cột sát nhau và OCR dễ
-    # đảo cột. Không tự tạo bảng sai cấu trúc: giữ kết quả trống để người
-    # dùng kiểm tra/nhập lại trong bảng chỉnh sửa ở Bước 3.
-    if ("familyname" in sgcl_normalize(headers[0])
-            and any(page.get("source_type") == "OCR" for page in pages)):
-        return empty
+    # Trang scan (OCR): tách bảng theo vị trí chữ + đường kẻ của bảng
+    if any(page.get("source_type") == "OCR" for page in pages):
+        rows, first_page = [], None
+        for page in pages:
+            try:
+                page_rows = sgcl_extract_table_layout(page, headers)
+            except Exception:
+                page_rows = []
+            if page_rows and first_page is None:
+                first_page = page["page"]
+            rows.extend(page_rows)
+        return {
+            "headers": headers,
+            "rows": rows,
+            "page": first_page,
+            "found": bool(rows),
+        }
 
     if file_bytes is not None:
         try:
-            result = sgcl_extract_table_from_pdf(file_bytes, headers)
+            result = sgcl_extract_table_from_pdf(
+                file_bytes, headers, page_numbers={p["page"] for p in pages}
+            )
             if result:
                 return result
         except Exception:
@@ -1872,6 +2468,118 @@ def sgcl_extract_table(pages, headers, file_bytes=None):
         "page": source_page,
         "found": bool(rows)
     }
+
+# =========================================================
+# FILE GỘP NHIỀU CHỨNG TỪ: NHẬN DIỆN LOẠI THEO TỪNG TRANG
+# =========================================================
+
+# Tiêu đề thường gặp ở đầu trang của từng loại chứng từ
+SGCL_PAGE_TITLES = {
+    "Notice of Arrival": ["notice of arrival", "thông báo tàu đến"],
+    "Arrival Report": ["arrival report"],
+    "Ship’s Particulars": ["ship's particulars", "ship particulars", "thông số kỹ thuật tàu"],
+    "Last Port Clearance": ["port clearance", "persetujuan berlayar", "clearance certificate"],
+    "Crew List": ["crew list", "danh sách thuyền viên"],
+    "Crew’s Effects List": ["crew's effects", "crew effects", "hành lý thuyền viên"],
+    "Ship’s Stores List": ["ship's stores", "ship stores", "dự trữ của tàu"],
+    "Cargo Manifest": ["cargo manifest", "lược khai hàng hóa"],
+    "Bill of Lading": ["bill of lading"],
+    "Maritime Declaration of Health": ["maritime declaration of health", "kiểm dịch y tế"],
+    "International Ship Security Certificate": [
+        "international ship security certificate", "an ninh tàu biển",
+    ],
+    "Voyage Memory": ["voyage memory"],
+    "Kế hoạch cập cầu": ["kế hoạch tàu cập", "berthing plan"],
+}
+
+
+def sgcl_detect_page_type(text, config):
+    """Loại chứng từ của một trang, dựa vào tiêu đề ở phần đầu trang."""
+    # Bỏ dòng rác ngắn của OCR (mã QR, con dấu) rồi xét phần đầu trang
+    lines = [l for l in str(text or "").splitlines()
+             if len(re.sub(r"[^A-Za-z]", "", l)) >= 4]
+    head = sgcl_normalize(" ".join(lines[:25]))
+    if not head:
+        return None
+    best = None
+    for doc_type in config:
+        keys = list(SGCL_PAGE_TITLES.get(doc_type, []))
+        keys += [a for a in config[doc_type].get("aliases", []) if len(sgcl_normalize(a)) >= 8]
+        for key in keys:
+            k = sgcl_normalize(key)
+            if k and k in head:
+                pos = head.index(k)
+                # Ưu tiên tiêu đề xuất hiện sớm hơn, rồi tới tiêu đề dài hơn
+                rank = (-pos, len(k))
+                if best is None or rank > best[0]:
+                    best = (rank, doc_type)
+    return best[1] if best else None
+
+
+def sgcl_page_types(pages, config):
+    """Loại chứng từ của từng trang; trang không có tiêu đề nối tiếp trang trước."""
+    types, previous = [], None
+    for page in pages:
+        found = sgcl_detect_page_type(page.get("text", ""), config)
+        if found is None:
+            found = previous
+        types.append(found)
+        previous = found
+    return types
+
+
+def sgcl_pages_for_type(pages, types, doc_type):
+    """Chỉ giữ các trang thuộc loại chứng từ đang trích xuất (nếu nhận diện được)."""
+    matched = [p for p, t in zip(pages, types) if t == doc_type]
+    if matched:
+        return matched
+    unknown = [p for p, t in zip(pages, types) if t is None]
+    return unknown or pages
+
+
+def sgcl_extract_document_type(ship, doc_name, doc_type, fields, pages, file_bytes):
+    """Trích xuất các trường của một loại chứng từ, thay kết quả cũ cùng loại."""
+    ship["field_extractions"] = [
+        rec for rec in ship["field_extractions"]
+        if not (rec.get("document") == doc_name and rec.get("doc_type") == doc_type)
+    ]
+    names = [f["name"] for f in fields]
+
+    for field in [f for f in fields if f["type"] == "single"]:
+        result = sgcl_extract_single(pages, field["name"], other_fields=names)
+        ship["field_extractions"].append({
+            "id": str(uuid.uuid4()),
+            "document": doc_name,
+            "doc_type": doc_type,
+            "field": field["name"],
+            "type": "single",
+            "result": {"value": result["value"]},
+            "page": result["page"],
+            "found": result["found"],
+            "source_type": "extracted",
+        })
+
+    headers = [f["name"] for f in fields if f["type"] == "table"]
+    if headers:
+        table_result = sgcl_extract_table(pages, headers, file_bytes=file_bytes)
+        ship["field_extractions"].append({
+            "id": str(uuid.uuid4()),
+            "document": doc_name,
+            "doc_type": doc_type,
+            "field": f"Bảng dữ liệu - {doc_type}",
+            "type": "table",
+            "result": table_result,
+            "page": table_result["page"],
+            "found": table_result["found"],
+            "source_type": "extracted",
+        })
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def sgcl_cached_pdf_text(file_bytes):
+    """Đọc chữ/OCR một lần cho mỗi file, dùng lại khi trích xuất nhiều loại."""
+    return sgcl_get_all_pdf_text(file_bytes)
+
 
 def sgcl_ensure_ship_data(ship):
     ship.setdefault("field_extractions", [])
@@ -3308,86 +4016,57 @@ else:
                                 + field["name"]
                             )
 
-                        if st.button(
+                        page_types_saved = ship.setdefault("page_types", {}).get(selected_name)
+                        if page_types_saved and len({t for t in page_types_saved if t}) > 1:
+                            summary = {}
+                            for no, t in enumerate(page_types_saved, start=1):
+                                summary.setdefault(t or "Không rõ", []).append(str(no))
+                            st.caption(
+                                "File gộp nhiều chứng từ — trang theo loại: " + "; ".join(
+                                    f"{t}: tr. {', '.join(nos)}" for t, nos in summary.items()
+                                )
+                            )
+
+                        extract_one = st.button(
                             "🔍 Trích xuất toàn bộ trường",
                             type="primary",
                             use_container_width=True,
                             key=f"s3_extract_{ship['id']}_{sgcl_normalize(selected_name)}"
-                        ):
+                        )
+                        extract_all = st.button(
+                            "📚 Trích xuất tất cả loại chứng từ có trong file",
+                            use_container_width=True,
+                            help="Dùng cho file PDF gộp nhiều chứng từ: tự nhận diện "
+                                 "loại chứng từ của từng trang theo tiêu đề rồi trích xuất hết.",
+                            key=f"s3_extract_all_{ship['id']}_{sgcl_normalize(selected_name)}"
+                        )
+
+                        if extract_one or extract_all:
                             with st.spinner(
-                                "Đang đọc toàn bộ trang của chứng từ..."
+                                "Đang đọc toàn bộ trang của chứng từ "
+                                "(bản scan cần OCR có thể mất vài chục giây)..."
                             ):
                                 try:
-                                    pages = sgcl_get_all_pdf_text(
-                                        file_bytes
-                                    )
+                                    pages = sgcl_cached_pdf_text(file_bytes)
+                                    types = sgcl_page_types(pages, config)
+                                    ship.setdefault("page_types", {})[selected_name] = types
 
-                                    # Xóa kết quả cũ của đúng chứng từ
-                                    # và đúng loại chứng từ
-                                    ship["field_extractions"] = [
-                                        rec for rec in ship["field_extractions"]
-                                        if not (
-                                            rec.get("document") == selected_name
-                                            and rec.get("doc_type") == chosen_type
+                                    if extract_all:
+                                        targets = [t for t in dict.fromkeys(types) if t]
+                                        if not targets:
+                                            targets = [chosen_type]
+                                    else:
+                                        targets = [chosen_type]
+
+                                    for doc_type in targets:
+                                        doc_fields = config.get(doc_type, {}).get("fields", [])
+                                        if not doc_fields:
+                                            continue
+                                        sgcl_extract_document_type(
+                                            ship, selected_name, doc_type, doc_fields,
+                                            sgcl_pages_for_type(pages, types, doc_type),
+                                            file_bytes
                                         )
-                                    ]
-
-                                    single_fields = [
-                                        field for field in fields
-                                        if field["type"] == "single"
-                                    ]
-
-                                    table_fields = [
-                                        field for field in fields
-                                        if field["type"] == "table"
-                                    ]
-
-                                    # Trường đơn
-                                    for field in single_fields:
-                                        result = sgcl_extract_single(
-                                            pages,
-                                            field["name"],
-                                            other_fields=[f["name"] for f in fields]
-                                        )
-
-                                        ship["field_extractions"].append({
-                                            "id": str(uuid.uuid4()),
-                                            "document": selected_name,
-                                            "doc_type": chosen_type,
-                                            "field": field["name"],
-                                            "type": "single",
-                                            "result": {
-                                                "value": result["value"]
-                                            },
-                                            "page": result["page"],
-                                            "found": result["found"],
-                                            "source_type": "extracted"
-                                        })
-
-                                    # Nhóm các trường bảng thành một bảng
-                                    if table_fields:
-                                        headers = [
-                                            field["name"]
-                                            for field in table_fields
-                                        ]
-
-                                        table_result = sgcl_extract_table(
-                                            pages,
-                                            headers,
-                                            file_bytes=file_bytes
-                                        )
-
-                                        ship["field_extractions"].append({
-                                            "id": str(uuid.uuid4()),
-                                            "document": selected_name,
-                                            "doc_type": chosen_type,
-                                            "field": f"Bảng dữ liệu - {chosen_type}",
-                                            "type": "table",
-                                            "result": table_result,
-                                            "page": table_result["page"],
-                                            "found": table_result["found"],
-                                            "source_type": "extracted"
-                                        })
 
                                     sgcl_invalidate_review(ship)
                                     ship["step_status"]["3"] = "done"
@@ -3405,7 +4084,7 @@ else:
                                         if rec.get("document") == selected_name
                                     )
                                     flash(
-                                        f"Đã trích xuất xong: tìm thấy "
+                                        f"Đã trích xuất xong {len(targets)} loại chứng từ: tìm thấy "
                                         f"{found_count}/{total_count} mục. "
                                         "Bà kiểm tra và chỉnh sửa kết quả bên dưới."
                                     )
@@ -3440,7 +4119,8 @@ else:
 
                         a.markdown(f"**{rec['field']}**")
                         a.caption(
-                            f"Nguồn: {rec.get('document', '')} "
+                            f"Loại: {rec.get('doc_type', '')} "
+                            f"· Nguồn: {rec.get('document', '')} "
                             f"· Trang: {rec.get('page') or 'Chưa xác định'}"
                         )
 
@@ -4446,14 +5126,26 @@ else:
                                         else ""
                                     )
 
-                                    if str(value).strip():
-                                        sgcl_write_cell(
-                                            ws,
-                                            start_row + row_index,
-                                            column_number,
-                                            value
-                                        )
-                                        written_count += 1
+                                    if not str(value).strip():
+                                        continue
+
+                                    # Crew list: tách ô gộp thành các cột
+                                    # riêng của mẫu (Họ|Tên, Ngày|Nơi sinh,
+                                    # Số|Hạn hộ chiếu)
+                                    parts = (
+                                        sgcl_split_crew_cell(header, value)
+                                        if sheet_name == "Crew list" else None
+                                    ) or [(0, value)]
+
+                                    for offset, part in parts:
+                                        if str(part).strip():
+                                            sgcl_write_cell(
+                                                ws,
+                                                start_row + row_index,
+                                                column_number + offset,
+                                                part
+                                            )
+                                            written_count += 1
 
                     # -------------------------------------
                     # LƯU THÀNH FILE RIÊNG
